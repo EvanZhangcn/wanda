@@ -61,8 +61,8 @@ def prepare_calibration_input(model, dataloader, device):
     layers = model.model.layers
 
     # dev = model.hf_device_map["model.embed_tokens"]
-    if "model.embed_tokens" in model.hf_device_map:
-        device = model.hf_device_map["model.embed_tokens"]
+    # if "model.embed_tokens" in model.hf_device_map:
+    #     device = model.hf_device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)

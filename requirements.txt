@@ -1,0 +1,6 @@
+transformers==4.45.1
+datasets==3.4.1
+wandb
+sentencepiece
+accelerate==0.26.0
+numpy
