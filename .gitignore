@@ -1,4 +1,24 @@
-/*__pycache__/
-.env
+# Python cache
+__pycache__/
 *.pyc
-*.DS_Store
+
+# Environment variables
+.env
+
+# OS-specific files
+.DS_Store
+
+# Large model weights and generated data
+llm_weights/
+out/
+compensation_params/
+
+# Results, plots, and logs
+results/
+results_1/
+results_2/
+results_3/
+svd_analysis_plots_2x2/
+svd_analysis_plots_2x2_1/
+*.log
+*.png

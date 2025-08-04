@@ -85,13 +85,14 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
     testenc = testenc.input_ids
 
     # Calculate number of samples
+    #样本数量  = test的tokens的总数 / model.seqlen 是模型单次能处理的token数量（即每个样本的固定长度）
     nsamples = testenc.numel() // model.seqlen
 
     # List to store negative log likelihoods
     nlls = []
     print(f"nsamples {nsamples}")
 
-    # Loop through each batch
+    # Loop through each batch   每次处理的样本数为bs
     for i in range(0,nsamples,bs):
         if i % 50 == 0:
             print(f"sample {i}")
@@ -114,13 +115,13 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
 
-        # Calculate negative log likelihood
+        # Calculate negative log likelihood，计算负对数似然
         neg_log_likelihood = loss.float() * model.seqlen * (j-i)
 
         # Append to list of negative log likelihoods
         nlls.append(neg_log_likelihood)
 
-    # Compute perplexity
+    # Compute perplexity，计算困惑度，困惑度= exp(负对数似然总和/总token数)
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
 
     # Empty CUDA cache to save memory
@@ -131,13 +132,20 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
 
 def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hellaswag","winogrande","arc_challenge","arc_easy","openbookqa"], 
         num_fewshot=0, use_accelerate=False, add_special_tokens=False):
-    from lm_eval import tasks, evaluator 
+    from lm_eval import tasks, evaluator
+    # 工具函数：用通配符匹配任务名，得到实际的任务名称列表
     def pattern_match(patterns, source_list):
+        #pattern给出的是通配符，source_list是任务列表
+        #patterns = ["arc_*", "boolq"]
+        #source_list = ["arc_easy", "arc_challenge", "boolq", "rte", "hellaswag"]
+        #如pattern为 “arc_*”时， 筛选出matching为 arc_easy, arc_challenge
         task_names = set()
         for pattern in patterns:
             for matching in fnmatch.filter(source_list, pattern):
                 task_names.add(matching)
         return list(task_names)
+
+    ## 构造模型参数字符串
     task_names = pattern_match(task_list, tasks.ALL_TASKS)
     model_args = f"pretrained={model_name},cache_dir=./llm_weights"
     limit = None 
