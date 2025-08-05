@@ -47,11 +47,9 @@ def main():
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
     parser.add_argument("--eval_zero_shot", action="store_true")
     parser.add_argument('--compensation_rank', type=int, default=None, help='Rank for low-rank approximation in compensation')
-    parser.add_argument('--compensation_params_path', type=str, default=None, help='Path to save/load compensation parameters.')
-    
-    
+
     parser.add_argument('--alpha', type=float, default=0.5, help='Strength for smoothing migration (alpha hyperparameter).')
-    parser.add_argument('--spectral_alpha', type=float, default=0.5, help='Power for spectral amplification (e.g., 0.5, 1.0).')
+
     #解析传入的参数，存入args
     args = parser.parse_args()
 
@@ -82,24 +80,22 @@ def main():
     if args.sparsity_ratio != 0:
         print("pruning starts")
         if args.prune_method == "wanda":
-            #prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-            prune_wanda_with_compensation(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m,
-                                          enable_compensation=False)
+            prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "magnitude":
             prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "sparsegpt":
             prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "wanda_compensation":
-            # 检查是否提供了补偿参数路径
-            if not args.compensation_params_path:
-                raise ValueError("Compensation parameters path must be provided for wanda_compensation method.")
             print("Generating compensation parameters...")
+            # 1. 调用函数，直接在内存中获取补偿参数字典
             compensation_params = prune_wanda_with_compensation(
-                args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, enable_compensation=True)
-            # 补偿参数已在函数内部保存，这里只需加载和替换模型
+                args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+
+            # 2. 检查是否成功生成了参数，并直接将其传入下一个函数
             if compensation_params:
                 print("Creating final compensated model...")
-                model = create_final_compensated_model(model, args.compensation_params_path)
+                # 3. 直接传递内存中的字典,而不是保存路径
+                model = create_final_compensated_model(model, compensation_params)
                 print("Final compensated model created.")
             else:
                 print("Warning: No compensation parameters were generated!")

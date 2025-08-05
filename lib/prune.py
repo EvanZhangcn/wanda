@@ -36,21 +36,25 @@ class CompensatedSparseLinear(nn.Module):
             else:
                 x_2d = x
                 
-            # 确保设备一致性并应用smoothing
-            x_smoothed = x_2d.to(self.s_inv.device) * self.s_inv  # (batch*seq, in_features)
+            # 确保设备一致性并应用smoothing，同时确保数据类型一致
+            x_smoothed = x_2d.to(self.s_inv.device, dtype=self.s_inv.dtype) * self.s_inv  # (batch*seq, in_features)
             
             # 低秩补偿计算: x_smoothed @ (L1 @ L2)^T = x_smoothed @ L2^T @ L1^T
             # L2^T: (in_features, rank), L1^T: (rank, out_features)
-            temp = x_smoothed @ self.L2.t().to(x_smoothed.device)   # (batch*seq, rank)
-            output_compensation = temp @ self.L1.t().to(x_smoothed.device)  # (batch*seq, out_features)
+            # 确保所有参数都在同一设备和数据类型
+            L2_t = self.L2.t().to(x_smoothed.device, dtype=x_smoothed.dtype)
+            L1_t = self.L1.t().to(x_smoothed.device, dtype=x_smoothed.dtype)
+            
+            temp = x_smoothed @ L2_t   # (batch*seq, rank)
+            output_compensation = temp @ L1_t  # (batch*seq, out_features)
             
             # 将补偿输出重塑回原始输出形状
             if len(original_shape) > 2:
                 # 需要重塑为与output_sparse相同的形状
                 output_compensation = output_compensation.view(*original_shape[:-1], -1)
             
-            # 确保补偿输出与稀疏输出在同一设备上
-            output_compensation = output_compensation.to(output_sparse.device)
+            # 确保补偿输出与稀疏输出在同一设备和数据类型上
+            output_compensation = output_compensation.to(output_sparse.device, dtype=output_sparse.dtype)
             
             # 合并结果
             return output_sparse + output_compensation
@@ -62,10 +66,7 @@ class CompensatedSparseLinear(nn.Module):
         self.sparse_linear.to(*args, **kwargs)
         return self
 
-def create_final_compensated_model(structured_model, compensation_params_path):
-    # 加载离线生成的补偿参数
-    compensation_params = torch.load(compensation_params_path)
-    
+def create_final_compensated_model(structured_model, compensation_params):
     # 遍历模型的所有模块
     for name, module in structured_model.named_modules():
         if name in compensation_params:
@@ -73,10 +74,13 @@ def create_final_compensated_model(structured_model, compensation_params_path):
                 print(f"Replacing layer: {name}")
                 
                 # 创建新的补偿层
-                # 将补偿参数移动到与模型相同的设备
+                # 将补偿参数移动到与模型相同的设备和数据类型
                 params = compensation_params[name]
+                target_dtype = module.weight.dtype
+                target_device = module.weight.device
+                
                 for k, v in params.items():
-                    params[k] = v.to(module.weight.device)
+                    params[k] = v.to(device=target_device, dtype=target_dtype)
 
                 new_layer = CompensatedSparseLinear(module, params)
                 
@@ -109,17 +113,14 @@ def calculate_smoothing_scale_factor(activation_scales, delta_B, alpha=0.5):
     epsilon = 1e-6
     s = torch.pow(activation_scales, alpha) / (torch.pow(delta_B_row_norms, 1 - alpha) + epsilon)
     
+    # 如果一个通道在 delta_B 中全为零，
+    # 那么它的缩放因子应该为1，即不进行缩放。
+    # 我们通过检查原始的 delta_B_row_norms 来定位这些通道。
+    s[delta_B_row_norms == 0] = 1.0
+
+
     # 对s进行裁剪，防止出现极端值
     s = torch.clamp(s, min=1e-5) 
-
-
-    # 修改：净化代码；检查并替换 s 中的 inf 和 nan 值
-    if torch.isinf(s).any() or torch.isnan(s).any():
-        # --- 新增：打印被净化的值的数量 ---
-        num_sanitized = torch.isinf(s).sum() + torch.isnan(s).sum()
-        print(f"      - Warning: Sanitizing {num_sanitized} out of {s.numel()} values in 's'.")
-        # --- 新增结束 ---
-        s = torch.nan_to_num(s, nan=1.0, posinf=1.0, neginf=1.0)
     return s
 
 def low_rank_approximation_factors(matrix, rank):
@@ -511,11 +512,9 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     torch.cuda.empty_cache()
 
 
-def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, enable_compensation=False):
+def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     """
-    带有补偿功能的Wanda剪枝方法
-    当enable_compensation=True时，执行贯序补偿逻辑
-    当enable_compensation=False时，执行标准Wanda剪枝
+    执行带有补偿逻辑的Wanda剪枝并返回补偿参数
     """
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -537,6 +536,8 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
         layer = layers[i]
         subset = find_layers(layer)
 
+        # 设置设备，默认使用传入的device参数
+        dev = device
         if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
             inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
@@ -569,255 +570,205 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
             original_weight = subset[name].weight.data.clone()
             W_metric = torch.abs(original_weight) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
 
-            if enable_compensation:
-                # === 参数生成逻辑 ===
-                print(f"  Step 1: Computing unstructured pruning target...")
-                
-                # 计算非结构化剪枝目标
-                W_mask_unstructured = (torch.zeros_like(W_metric) == 1)
-                sort_res = torch.sort(W_metric, dim=-1, stable=True)
+            print(f"  Step 1: Computing unstructured pruning target...")
+            # 计算非结构化剪枝目标
+            W_mask_unstructured = (torch.zeros_like(W_metric) == 1)
+            sort_res = torch.sort(W_metric, dim=-1, stable=True)
+            indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
+            W_mask_unstructured.scatter_(1, indices, True)
 
-                if args.use_variant:
-                    tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                    sum_before = W_metric.sum(dim=1)
-                    alpha = 0.4
-                    alpha_hist = [0., 0.8]
+            B_unstructured = original_weight.clone()
+            B_unstructured[W_mask_unstructured] = 0
+            print(f"    B_unstructured sparsity: {(B_unstructured == 0).float().mean():.6f}")
 
-                    W_mask_unstructured, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    while (torch.abs(cur_sparsity - args.sparsity_ratio) > 0.001) and (alpha_hist[1] - alpha_hist[0] >= 0.001):
-                        if cur_sparsity > args.sparsity_ratio:
-                            alpha_new = (alpha + alpha_hist[0]) / 2.0
-                            alpha_hist[1] = alpha
-                        else:
-                            alpha_new = (alpha + alpha_hist[1]) / 2.0
-                            alpha_hist[0] = alpha
-                        alpha = alpha_new
-                        W_mask_unstructured, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    print(f"    Unstructured: alpha found {alpha} sparsity {cur_sparsity:.6f}")
-                else:
-                    indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
-                    W_mask_unstructured.scatter_(1, indices, True)
 
-                B_unstructured = original_weight.clone()
-                B_unstructured[W_mask_unstructured] = 0
-                print(f"    B_unstructured sparsity: {(B_unstructured == 0).float().mean():.6f}")
-
-                print(f"  Step 2: Computing structured pruning result...")
-                W_mask_structured = (torch.zeros_like(W_metric) == 1)
-
-                if prune_n != 0:
-                    # 结构化剪枝
-                    for ii in range(W_metric.shape[1]):
-                        if ii % prune_m == 0:
-                            tmp = W_metric[:, ii:(ii + prune_m)].float()
-                            W_mask_structured.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
-                else:
-                    # 如果没有指定n:m，则结构化掩码与非结构化掩码相同
-                    W_mask_structured = W_mask_unstructured.clone()
-
-                B_structured = original_weight.clone()
-                B_structured[W_mask_structured] = 0
-                
-                #这里计算结构化稀疏性有点问题，按规则
-                structured_sparsity = (B_structured == 0).float().mean()
-                print(f"    B_structured sparsity: {structured_sparsity:.6f}")
-
-                if 'down_proj' in name:
-                    print(f"      --> This is a 'down_proj' layer. Applying full compensation logic...")
-
-                    print(f"  Step 3: Computing compensation matrix (delta_B)...")
-                    delta_B = B_unstructured - B_structured
-
-                    if torch.norm(delta_B) > 1e-8:
-                                            # --- 新增：Smoothing 预处理 ---
-                        print(f"  Step 3a: Applying Smoothing to delta_B...")
-                        
-                        try:
-                            # 1. 获取激活尺度 (现在inp1只包含每个通道的最大激活值)
-                            activation_scales = wrapped_layers[name].inp1.to(dev)
-
-                            if activation_scales.shape[1] != delta_B.shape[1]:
-                                activation_scales = activation_scales.t()  # 转置以匹配期望的形状 (1, in_features)
-
-                            # 2. 计算缩放因子 s 和其倒数 s_inv
-                            #s = calculate_smoothing_scale_factor(activation_scales, delta_B)
-                            s = calculate_smoothing_scale_factor(activation_scales, delta_B, alpha=args.alpha)
-                            s_inv = 1.0 / s
-
-                            # 3. 对 delta_B 进行变换
-                            delta_B_smoothed = delta_B * s
-
-                            import os
-                            import numpy as np
-                            import matplotlib.pyplot as plt
-                            from kneed import KneeLocator
-                            # =================================================================================
-                            # === SVD分析、能量计算、拐点检测的最终代码 ===
-                            # =================================================================================
-                            print(f"  Step 3b: Analyzing SVD Spectrum for delta_B vs delta_B_smoothed...")
-                            # --- 1. 定义一个可复用的绘图辅助函数 ---
-                            def plot_svd_analysis(axes_row, matrix, matrix_name, title_prefix):
-                                """
-                                对给定的矩阵进行SVD分析和绘图，画在一行子图上。
-                                :param axes_row: 一行两个子图 (e.g., axes[0])
-                                :param matrix: 要分析的torch矩阵 (delta_B or delta_B_smoothed)
-                                :param matrix_name: 矩阵的名字，用于标题 (e.g., "delta_B")
-                                :param title_prefix: 图表的主标题前缀 (e.g., "Layer 0 Sublayer mlp.proj")
-                                """
-                                with torch.no_grad():
-                                    singular_values = torch.linalg.svdvals(matrix.float()).cpu().numpy()
-
-                                # 计算能量
-                                total_energy = np.sum(singular_values**2)
-                                cumulative_energy = np.cumsum(singular_values**2)
-                                cumulative_energy_ratio = cumulative_energy / total_energy
-
-                                # --- 左侧子图：完整谱图 ---
-                                ax_left = axes_row[0]
-                                ax_left.plot(singular_values)
-                                ax_left.set_yscale('log')
-                                ax_left.set_title(f'Complete Spectrum of {matrix_name}\n{title_prefix}')
-                                ax_left.set_xlabel('Singular Value Index')
-                                ax_left.set_ylabel('Singular Value (log scale)')
-                                ax_left.grid(True)
-
-                                # --- 右侧子图：局部放大和标注 ---
-                                ax_right = axes_row[1]
-                                num_values_to_show = 64
-                                plot_indices = np.arange(min(len(singular_values), num_values_to_show))
-                                safe_singular_values = singular_values[:len(plot_indices)] + 1e-10
-
-                                ax_right.plot(plot_indices, safe_singular_values, 'b-')
-                                ax_right.set_yscale('log')
-                                ax_right.set_title(f'First {num_values_to_show} Values of {matrix_name}\n{title_prefix}')
-                                ax_right.set_xlabel('Singular Value Index')
-                                ax_right.set_ylabel('Singular Value (log scale)')
-                                ax_right.grid(True)
-                                
-                                # 标注肘部点
-                                try:
-                                    if len(plot_indices) > 1:
-                                        kneedle = KneeLocator(plot_indices, np.log10(safe_singular_values), S=1.0, curve="convex", direction="decreasing")
-                                        if kneedle.elbow is not None:
-                                            x, y = kneedle.elbow, singular_values[kneedle.elbow]
-                                            energy = cumulative_energy_ratio[x] * 100
-                                            ax_right.annotate(f'Elbow (Rank {x})\nEnergy: {energy:.2f}%', xy=(x, y), xytext=(15, 40), textcoords='offset points', arrowprops=dict(facecolor='green', shrink=0.05), bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.7))
-                                except Exception as e:
-                                    print(f"      - Could not find or annotate elbow point for {matrix_name}: {e}")
-
-                                # 标注秩32
-                                if len(plot_indices) >= 32:
-                                    x, y = 31, singular_values[31]
-                                    energy = cumulative_energy_ratio[x] * 100
-                                    ax_right.annotate(f'Top 32 Ranks\nEnergy: {energy:.2f}%', xy=(x, y), xytext=(-80, -40), textcoords='offset points', arrowprops=dict(facecolor='red', shrink=0.05))
-
-                                # 标注秩64
-                                if len(plot_indices) >= 64:
-                                    x, y = 63, singular_values[63]
-                                    energy = cumulative_energy_ratio[x] * 100
-                                    ax_right.annotate(f'Top 64 Ranks\nEnergy: {energy:.2f}%', xy=(x, y), xytext=(-80, 20), textcoords='offset points', arrowprops=dict(facecolor='purple', shrink=0.05))
-
-                            # --- 2. 创建 2x2 的图纸并调用辅助函数 ---
-                            # 设置保存路径
-                            save_dir = "svd_analysis_plots_2x2"
-                            os.makedirs(save_dir, exist_ok=True)
-                            full_module_path = f"model.layers.{i}.{name}"
-                            filename_part = full_module_path.replace('.', '_')
-                            filepath = os.path.join(save_dir, f"svd_comparison_{filename_part}.png")
-
-                            # 创建2x2子图
-                            fig, axes = plt.subplots(2, 2, figsize=(20, 14))
-                            title_prefix = f'Layer {i} Sublayer {name}'
-                            fig.suptitle(f'SVD Analysis Comparison\n{title_prefix}', fontsize=16)
-
-                            # 上面一行：分析 delta_B (平滑前)
-                            plot_svd_analysis(axes[0], delta_B, "delta_B (Before Smoothing)", title_prefix)
-
-                            # 下面一行：分析 delta_B_smoothed (平滑后)
-                            plot_svd_analysis(axes[1], delta_B_smoothed, "delta_B_smoothed (After Smoothing)", title_prefix)
-
-                            # 保存并关闭图形
-                            fig.tight_layout(rect=[0, 0.03, 1, 0.95]) # 调整布局为总标题留出空间
-                            plt.savefig(filepath)
-                            plt.close(fig)
-                            print(f"    2x2 Comparison plot saved to: {filepath}")
-
-                            # --- 新代码块结束 ---
-
-                            # 清理中间变量以节省内存
-                            del activation_scales, s
-                            torch.cuda.empty_cache()
-                            
-                            # --- 修改：计算低秩因子 ---
-                            print(f"  Step 4: Computing low-rank factors...")
-                            compensation_rank = getattr(args, 'compensation_rank', None)
-                            
-                            if compensation_rank is None:
-                                compensation_rank = min(delta_B_smoothed.shape[0], delta_B_smoothed.shape[1]) // 4
-                            
-                            L1, L2 = low_rank_approximation_factors(delta_B_smoothed, rank=compensation_rank)
-
-                            # --- 修改：保存参数而非应用 ---
-                            layer_key = f"model.layers.{i}.{name}" # 使用标准模块名作为键
-                            compensation_params[layer_key] = {
-                                'L1': L1.cpu(),      # 移到CPU以节省GPU内存
-                                'L2': L2.cpu(),
-                                's_inv': s_inv.cpu()
-                            }
-                            print(f"    Compensation parameters for {layer_key} have been generated and stored.")
-                            
-                            # 清理GPU内存
-                            del L1, L2, s_inv, delta_B_smoothed
-                            torch.cuda.empty_cache()
-                            
-                        except Exception as e:
-                            print(f"    Error in smoothing/compensation: {e}")
-                            print(f"    Skipping compensation for this layer.")
-                            
-                    else:
-                        print(f"    No compensation needed (delta_B norm is too small).")
-
-                # 层的权重被设置为纯粹的、稀疏的结构化剪枝结果
-                subset[name].weight.data = B_structured
-                print(f"    Layer weight is set to the sparse structured matrix (sparsity preserved).")
-                
-                final_sparsity = (subset[name].weight.data == 0).float().mean()
-                print(f"    Final layer sparsity: {final_sparsity:.6f}")
-
+            print(f"  Step 2: Computing structured pruning result...")
+            # 计算结构化剪枝目标
+            W_mask_structured = (torch.zeros_like(W_metric) == 1)
+            if prune_n != 0:
+                for ii in range(W_metric.shape[1]):
+                    if ii % prune_m == 0:
+                        tmp = W_metric[:, ii:(ii + prune_m)].float()
+                        W_mask_structured.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
             else:
-                # === 标准Wanda剪枝逻辑 (无补偿) ===
-                W_mask = (torch.zeros_like(W_metric) == 1)
+                # 如果没有指定n:m，则结构化掩码与非结构化掩码相同
+                W_mask_structured = W_mask_unstructured.clone()
 
-                if prune_n != 0:
-                    for ii in range(W_metric.shape[1]):
-                        if ii % prune_m == 0:
-                            tmp = W_metric[:, ii:(ii + prune_m)].float()
-                            W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
-                else:
-                    sort_res = torch.sort(W_metric, dim=-1, stable=True)
+            B_structured = original_weight.clone()
+            B_structured[W_mask_structured] = 0     
+            print(f"    B_structured sparsity: {(B_structured == 0).float().mean():.6f}")
 
-                    if args.use_variant:
-                        tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                        sum_before = W_metric.sum(dim=1)
-                        alpha = 0.4
-                        alpha_hist = [0., 0.8]
 
-                        W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                        while (torch.abs(cur_sparsity - args.sparsity_ratio) > 0.001) and (alpha_hist[1] - alpha_hist[0] >= 0.001):
-                            if cur_sparsity > args.sparsity_ratio:
-                                alpha_new = (alpha + alpha_hist[0]) / 2.0
-                                alpha_hist[1] = alpha
-                            else:
-                                alpha_new = (alpha + alpha_hist[1]) / 2.0
-                                alpha_hist[0] = alpha
-                            alpha = alpha_new
-                            W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                        print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
+
+            print(f"  Step 3: Computing compensation matrix (delta_B)...")
+            delta_B = B_unstructured - B_structured
+
+            if torch.norm(delta_B) > 1e-8:
+                print(f"  Step 3a: Applying Smoothing to delta_B...")
+                
+                try:
+                    # 1. 获取激活尺度 (现在act_scales只包含每个通道的最大激活值)
+                    activation_scales = wrapped_layers[name].act_scales.to(dev)
+                    
+                    # 确保activation_scales是正确的形状 (1, in_features)
+                    if activation_scales.dim() == 1:
+                        activation_scales = activation_scales.unsqueeze(0)  # 从 (in_features,) 转为 (1, in_features)
+
+                    # ======================= 新增诊断代码块 开始 =======================
+                    print(f"    - Analyzing delta_B for layer {name}...")
+                    # 计算将作为分母的 delta_B 逐列最大绝对值
+                    delta_B_col_max_abs = torch.max(torch.abs(delta_B), dim=0)[0]
+
+                    # 检查有多少列的最大绝对值为零
+                    zero_cols_count = (delta_B_col_max_abs == 0).sum().item()
+
+                    if zero_cols_count > 0:
+                        print(f"    - WARNING: Found {zero_cols_count} columns in delta_B that are entirely zero.")
+                        # （可选）如果想看得更详细，可以取消下面这行的注释
+                        # print(f"    - Indices of zero columns: {torch.where(delta_B_col_max_abs == 0)[0].cpu().numpy()}")
                     else:
-                        indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
-                        W_mask.scatter_(1, indices, True)
+                        print("    - OK: No all-zero columns found in delta_B.")
+                    # ======================= 新增诊断代码块 结束 =======================
 
-                subset[name].weight.data[W_mask] = 0
+                    # 2. 计算缩放因子 s 和其倒数 s_inv
+                    #s = calculate_smoothing_scale_factor(activation_scales, delta_B)
+                    s = calculate_smoothing_scale_factor(activation_scales, delta_B, alpha=args.alpha)
+                    s_inv = 1.0 / s
+
+                    # 3. 对 delta_B 进行变换
+                    delta_B_smoothed = delta_B * s
+
+                    import os
+                    import numpy as np
+                    import matplotlib.pyplot as plt
+                    from kneed import KneeLocator
+                    # =================================================================================
+                    # === SVD分析、能量计算、拐点检测的最终代码 ===
+                    # =================================================================================
+                    print(f"  Step 3b: Analyzing SVD Spectrum for delta_B vs delta_B_smoothed...")
+                    # --- 1. 定义一个可复用的绘图辅助函数 ---
+                    def plot_svd_analysis(axes_row, matrix, matrix_name, title_prefix):
+                        """
+                        对给定的矩阵进行SVD分析和绘图，画在一行子图上。
+                        :param axes_row: 一行两个子图 (e.g., axes[0])
+                        :param matrix: 要分析的torch矩阵 (delta_B or delta_B_smoothed)
+                        :param matrix_name: 矩阵的名字，用于标题 (e.g., "delta_B")
+                        :param title_prefix: 图表的主标题前缀 (e.g., "Layer 0 Sublayer mlp.proj")
+                        """
+                        with torch.no_grad():
+                            singular_values = torch.linalg.svdvals(matrix.float()).cpu().numpy()
+
+                        # 计算能量
+                        total_energy = np.sum(singular_values**2)
+                        cumulative_energy = np.cumsum(singular_values**2)
+                        cumulative_energy_ratio = cumulative_energy / total_energy
+
+                        # --- 左侧子图：完整谱图 ---
+                        ax_left = axes_row[0]
+                        ax_left.plot(singular_values)
+                        ax_left.set_yscale('log')
+                        ax_left.set_title(f'Complete Spectrum of {matrix_name}\n{title_prefix}')
+                        ax_left.set_xlabel('Singular Value Index')
+                        ax_left.set_ylabel('Singular Value (log scale)')
+                        ax_left.grid(True)
+
+                        # --- 右侧子图：局部放大和标注 ---
+                        ax_right = axes_row[1]
+                        num_values_to_show = 64
+                        plot_indices = np.arange(min(len(singular_values), num_values_to_show))
+                        safe_singular_values = singular_values[:len(plot_indices)] + 1e-10
+
+                        ax_right.plot(plot_indices, safe_singular_values, 'b-')
+                        ax_right.set_yscale('log')
+                        ax_right.set_title(f'First {num_values_to_show} Values of {matrix_name}\n{title_prefix}')
+                        ax_right.set_xlabel('Singular Value Index')
+                        ax_right.set_ylabel('Singular Value (log scale)')
+                        ax_right.grid(True)
+                        
+                        # 标注肘部点
+                        try:
+                            if len(plot_indices) > 1:
+                                kneedle = KneeLocator(plot_indices, np.log10(safe_singular_values), S=1.0, curve="convex", direction="decreasing")
+                                if kneedle.elbow is not None:
+                                    x, y = kneedle.elbow, singular_values[kneedle.elbow]
+                                    energy = cumulative_energy_ratio[x] * 100
+                                    ax_right.annotate(f'Elbow (Rank {x})\nEnergy: {energy:.2f}%', xy=(x, y), xytext=(15, 40), textcoords='offset points', arrowprops=dict(facecolor='green', shrink=0.05), bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.7))
+                        except Exception as e:
+                            print(f"      - Could not find or annotate elbow point for {matrix_name}: {e}")
+
+                        # 标注秩32
+                        if len(plot_indices) >= 32:
+                            x, y = 31, singular_values[31]
+                            energy = cumulative_energy_ratio[x] * 100
+                            ax_right.annotate(f'Top 32 Ranks\nEnergy: {energy:.2f}%', xy=(x, y), xytext=(-80, -40), textcoords='offset points', arrowprops=dict(facecolor='red', shrink=0.05))
+
+                        # 标注秩64
+                        if len(plot_indices) >= 64:
+                            x, y = 63, singular_values[63]
+                            energy = cumulative_energy_ratio[x] * 100
+                            ax_right.annotate(f'Top 64 Ranks\nEnergy: {energy:.2f}%', xy=(x, y), xytext=(-80, 20), textcoords='offset points', arrowprops=dict(facecolor='purple', shrink=0.05))
+
+                    # --- 2. 创建 2x2 的图纸并调用辅助函数 ---
+                    # 设置保存路径
+                    save_dir = "svd_analysis_plots_2x2"
+                    os.makedirs(save_dir, exist_ok=True)
+                    full_module_path = f"model.layers.{i}.{name}"
+                    filename_part = full_module_path.replace('.', '_')
+                    filepath = os.path.join(save_dir, f"svd_comparison_{filename_part}.png")
+
+                    # 创建2x2子图
+                    fig, axes = plt.subplots(2, 2, figsize=(20, 14))
+                    title_prefix = f'Layer {i} Sublayer {name}'
+                    fig.suptitle(f'SVD Analysis Comparison\n{title_prefix}', fontsize=16)
+
+                    # 上面一行：分析 delta_B (平滑前)
+                    plot_svd_analysis(axes[0], delta_B, "delta_B (Before Smoothing)", title_prefix)
+
+                    # 下面一行：分析 delta_B_smoothed (平滑后)
+                    plot_svd_analysis(axes[1], delta_B_smoothed, "delta_B_smoothed (After Smoothing)", title_prefix)
+
+                    # 保存并关闭图形
+                    fig.tight_layout(rect=[0, 0.03, 1, 0.95]) # 调整布局为总标题留出空间
+                    plt.savefig(filepath)
+                    plt.close(fig)
+                    print(f"    2x2 Comparison plot saved to: {filepath}")
+
+
+                    # 清理中间变量以节省内存
+                    del activation_scales, s
+                    torch.cuda.empty_cache()
+                    
+                    # --- 修改：计算低秩因子 ---
+                    print(f"  Step 4: Computing low-rank factors...")
+                    compensation_rank = getattr(args, 'compensation_rank', None)
+                    
+                    if compensation_rank is None:
+                        compensation_rank = min(delta_B_smoothed.shape[0], delta_B_smoothed.shape[1]) // 4
+                    
+                    L1, L2 = low_rank_approximation_factors(delta_B_smoothed, rank=compensation_rank)
+
+                    # --- 保存参数而非应用 ---
+                    layer_key = f"model.layers.{i}.{name}" # 使用标准模块名作为键
+                    compensation_params[layer_key] = {
+                        'L1': L1.cpu(),      # 移到CPU以节省GPU内存
+                        'L2': L2.cpu(),
+                        's_inv': s_inv.cpu()
+                    }
+                    print(f"    Compensation parameters for {layer_key} have been generated and stored.")
+                    
+                    # 清理GPU内存
+                    del L1, L2, s_inv, delta_B_smoothed
+                    torch.cuda.empty_cache()
+                    
+                except Exception as e:
+                    print(f"    Error in smoothing/compensation: {e}")
+                    print(f"    Skipping compensation for this layer.")                       
+            else:
+                print(f"    No compensation needed (delta_B norm is too small).")
+
+            #线性层的权重被设置为纯粹的、稀疏的结构化剪枝结果
+            subset[name].weight.data = B_structured
+            print(f"    Layer weight is set to the sparse structured matrix.")
 
         # 重新计算层输出
         for j in range(args.nsamples):
@@ -828,21 +779,8 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
     
-    if enable_compensation:
-        print("\n=== Wanda compensation parameter generation completed ===")
-        print(f"Generated parameters for {len(compensation_params)} layers")
-        
-        # 保存补偿参数到文件
-        if hasattr(args, 'compensation_params_path') and args.compensation_params_path:
-            import os
-            os.makedirs(os.path.dirname(args.compensation_params_path), exist_ok=True)
-            torch.save(compensation_params, args.compensation_params_path)
-            print(f"Compensation parameters saved to: {args.compensation_params_path}")
-        
-        # 返回生成的参数
-        return compensation_params
-    
-    return None # 对于标准Wanda，不返回任何内容
+    print("\n=== Wanda compensation parameter generation completed ===")
+    return compensation_params
 
 
 @torch.no_grad()
@@ -896,8 +834,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
             print(f"layer {i} device {dev}")
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(
-                dev), position_ids.to(dev)
+            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
 
         subset = find_layers(layer)
 
