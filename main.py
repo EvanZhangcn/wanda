@@ -2,6 +2,10 @@ import argparse
 import os 
 import numpy as np
 import torch
+import time
+import gc
+
+from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 
@@ -30,6 +34,85 @@ def get_llm(model_name, cache_dir="llm_weights"):
 
     return model
 
+
+def benchmark_performance(model, tokenizer, device, batch_size, num_repeats, seq_len, save_dir=None, prune_method=None):
+    """
+    对给定的模型进行性能评测（使用真实数据），测量延迟和吞吐量。
+    """
+    print("\n" + "*" * 30)
+    print("Running Performance Benchmark (using real data)...")
+    print(f"Batch Size: {batch_size}, Repetitions: {num_repeats}, Sequence Length: {seq_len}")
+    print("*" * 30)
+
+    # 1. 加载并预处理真实数据集
+    print("Loading and preprocessing dataset for benchmark...")
+    # 使用和您原始脚本相同的设置加载数据
+    dataset = load_dataset("wikipedia", "20220301.en", split="train[:1%]", trust_remote_code=True)
+
+    # 定义预处理函数，使用模型自身的序列长度
+    def preprocess_function(examples):
+        return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=seq_len)
+
+    encoded_dataset = dataset.map(preprocess_function, batched=True, remove_columns=["text"])
+
+    # 准备一个批次的数据
+    sample_batch = encoded_dataset.select(range(batch_size))
+    inputs = {
+        key: torch.tensor(val).to(device)
+        for key, val in sample_batch.to_dict().items()
+        if key in tokenizer.model_input_names
+    }
+    print("Data preparation complete.")
+
+    # 2. 预热（Warm-up）
+    print("Warming up...")
+    with torch.no_grad():
+        for _ in range(5):
+            _ = model(**inputs)
+    torch.cuda.synchronize()
+
+    # 3. 开始正式测量
+    inference_times = []
+    torch.cuda.reset_peak_memory_stats(device)  # 重置显存统计
+
+    print(f"Running benchmark for {num_repeats} iterations...")
+    for _ in range(num_repeats):
+        torch.cuda.synchronize(device)
+        start_time = time.time()
+
+        with torch.no_grad():
+            _ = model(**inputs)
+
+        torch.cuda.synchronize(device)
+        end_time = time.time()
+
+        inference_times.append(end_time - start_time)
+
+    # 清理
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # 4. 计算并报告结果
+    avg_inference_time = np.mean(inference_times)
+    throughput = batch_size / avg_inference_time
+    peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+    print("\n--- Benchmark Results ---")
+    print(f"Average Inference Time (Latency): {avg_inference_time * 1000:.4f} ms")
+    print(f"Throughput: {throughput:.2f} samples/second")
+    print(f"Peak GPU Memory Allocated: {peak_memory_mb:.2f} MB")
+    print("-------------------------\n")
+
+    # 将性能结果也追加到日志文件中
+    if save_dir and prune_method:
+        save_filepath = os.path.join(save_dir, f"log_{prune_method}.txt")
+        with open(save_filepath, "a") as f:  # 使用 "a" (append) 模式追加
+            f.write("\n--- Benchmark Results ---\n")
+            f.write(f"Batch Size: {batch_size}\n")
+            f.write(f"Latency: {avg_inference_time * 1000:.4f} ms\n")
+            f.write(f"Throughput: {throughput:.2f} samples/sec\n")
+            f.write(f"Peak Memory: {peak_memory_mb:.2f} MB\n")
+
 def main():
     #命令行参数解析器
     parser = argparse.ArgumentParser()
@@ -46,10 +129,10 @@ def main():
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
     parser.add_argument("--eval_zero_shot", action="store_true")
-    parser.add_argument('--compensation_rank', type=int, default=None, help='Rank for low-rank approximation in compensation')
 
-    parser.add_argument('--alpha', type=float, default=0.5, help='Strength for smoothing migration (alpha hyperparameter).')
-
+    parser.add_argument('--run_benchmark', action="store_true", help="Whether to run a performance benchmark after evaluation.")
+    parser.add_argument('--benchmark_batch_size', type=int, default=1, help="Batch size for performance benchmark.")
+    parser.add_argument('--benchmark_repeats', type=int, default=100, help="Number of repetitions for performance benchmark.")
     #解析传入的参数，存入args
     args = parser.parse_args()
 
@@ -132,6 +215,19 @@ def main():
         print("********************************")
         print("zero_shot evaluation results")
         print(results)
+
+    # 运行性能基准测试
+    if args.run_benchmark:
+        benchmark_performance(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            batch_size=args.benchmark_batch_size,
+            num_repeats=args.benchmark_repeats,
+            seq_len=model.seqlen,  # 使用模型自身的序列长度
+            save_dir=args.save,
+            prune_method=args.prune_method
+        )
 
     if args.save_model:
         model.save_pretrained(args.save_model)
