@@ -9,7 +9,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 
-from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers, prune_wanda_with_compensation, create_final_compensated_model
+from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers, prune_wanda_with_compensation
 from lib.eval import eval_ppl, eval_zero_shot
 
 print('torch', version('torch'))
@@ -47,7 +47,9 @@ def benchmark_performance(model, tokenizer, device, batch_size, num_repeats, seq
     # 1. 加载并预处理真实数据集
     print("Loading and preprocessing dataset for benchmark...")
     # 使用和您原始脚本相同的设置加载数据
-    dataset = load_dataset("wikipedia", "20220301.en", split="train[:1%]", trust_remote_code=True)
+    # 下面这个方式运行崩溃，不再支持了
+    #dataset = load_dataset("wikipedia", "20220301.en", split="train[:1%]", trust_remote_code=True)
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
     # 定义预处理函数，使用模型自身的序列长度
     def preprocess_function(examples):
@@ -89,8 +91,9 @@ def benchmark_performance(model, tokenizer, device, batch_size, num_repeats, seq
         inference_times.append(end_time - start_time)
 
     # 清理
-    gc.collect()
     torch.cuda.empty_cache()
+    gc.collect()
+
 
     # 4. 计算并报告结果
     avg_inference_time = np.mean(inference_times)
@@ -132,7 +135,7 @@ def main():
 
     parser.add_argument('--run_benchmark', action="store_true", help="Whether to run a performance benchmark after evaluation.")
     parser.add_argument('--benchmark_batch_size', type=int, default=1, help="Batch size for performance benchmark.")
-    parser.add_argument('--benchmark_repeats', type=int, default=100, help="Number of repetitions for performance benchmark.")
+    parser.add_argument('--benchmark_repeats', type=int, default=5, help="Number of repetitions for performance benchmark.")
     #解析传入的参数，存入args
     args = parser.parse_args()
 
@@ -171,17 +174,12 @@ def main():
         elif args.prune_method == "wanda_compensation":
             print("Generating compensation parameters...")
             # 1. 调用函数，直接在内存中获取补偿参数字典
-            compensation_params = prune_wanda_with_compensation(
+            # 这里返回的是个模型，只是之前低秩补偿返回的是补偿参数，名字没改沿用了“compensation_params”
+            #compensation_params = prune_wanda_with_compensation(
+            #    args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+            final_model = prune_wanda_with_compensation(
                 args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-
-            # 2. 检查是否成功生成了参数，并直接将其传入下一个函数
-            if compensation_params:
-                print("Creating final compensated model...")
-                # 3. 直接传递内存中的字典,而不是保存路径
-                model = create_final_compensated_model(model, compensation_params)
-                print("Final compensated model created.")
-            else:
-                print("Warning: No compensation parameters were generated!")
+            model = final_model
         elif "ablate" in args.prune_method:
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
 
@@ -216,6 +214,11 @@ def main():
         print("zero_shot evaluation results")
         print(results)
 
+
+    if args.save_model:
+        model.save_pretrained(args.save_model)
+        tokenizer.save_pretrained(args.save_model)
+
     # 运行性能基准测试
     if args.run_benchmark:
         benchmark_performance(
@@ -229,9 +232,7 @@ def main():
             prune_method=args.prune_method
         )
 
-    if args.save_model:
-        model.save_pretrained(args.save_model)
-        tokenizer.save_pretrained(args.save_model)
+
 
 if __name__ == '__main__':
     main()

@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from kneed import KneeLocator
 import os
+import gc
 
 from .sparsegpt import SparseGPT 
 from .layerwrapper import WrappedGPT
@@ -40,18 +41,9 @@ class CompensatedSparseLinear(nn.Module):
                 x_2d = x.view(-1, x.shape[-1])  # (batch_size*seq_len, input_dim)
             else:
                 x_2d = x
-                
-            # --- 临时类型转换，以绕过 float16 不支持的问题 ---
-            # 1. 将输入和补偿矩阵都上转型为 float32
-            x_2d_fp32 = x_2d.to(torch.float32)
-            delta_B_csr_fp32 = self.delta_B_csr.to(device=x_2d.device, dtype=torch.float32)
-            
-            # 2. 在 float32 精度下执行稀疏矩阵乘法
-            output_compensation_fp32 = torch.sparse.mm(delta_B_csr_fp32, x_2d_fp32.t()).t()
-            
-            # 3. 将结果转换回原始的 float16 类型，以便与 output_sparse 相加
-            output_compensation = output_compensation_fp32.to(x.dtype)
-            # --- 类型转换结束 ---
+
+            delta_B_csr_casted = self.delta_B_csr.to(device=x_2d.device, dtype=x.dtype)
+            output_compensation = torch.sparse.mm(delta_B_csr_casted, x_2d.t()).t()
 
             # 将补偿输出重塑回原始输出形状
             if len(original_shape) > 2:
@@ -70,32 +62,6 @@ class CompensatedSparseLinear(nn.Module):
         super().to(*args, **kwargs)
         self.sparse_linear.to(*args, **kwargs)
         return self
-
-def create_final_compensated_model(structured_model, compensation_params):
-    # 遍历模型的所有模块
-    for name, module in structured_model.named_modules():
-        if name in compensation_params:
-            if isinstance(module, nn.Linear):
-                print(f"Replacing layer: {name}")
-                
-                # 创建新的补偿层
-                # 将补偿参数移动到与模型相同的设备和数据类型
-                params = compensation_params[name]
-                target_dtype = module.weight.dtype
-                target_device = module.weight.device
-                
-                for k, v in params.items():
-                    params[k] = v.to(device=target_device, dtype=target_dtype)
-
-                new_layer = CompensatedSparseLinear(module, params)
-                
-                # 获取父模块并替换
-                parent_name, child_name = name.rsplit('.', 1)
-                parent_module = structured_model.get_submodule(parent_name)
-                setattr(parent_module, child_name, new_layer)
-                
-    return structured_model
-
 
 
 def check_nm_sparsity_ratio(matrix, n, m, dimension='row'):
@@ -317,75 +283,7 @@ CONCLUSION:
     return filepath
 
 
-def process_layer_compensation(layer_index, layer_name, original_weight, wrapped_layer, args, dev, prune_n=0, prune_m=0):
-    """处理单个层的补偿逻辑"""
-    print(f"Processing layer {layer_index} sublayer {layer_name}")
-    
-    W_metric = torch.abs(original_weight) * torch.sqrt(wrapped_layer.scaler_row.reshape((1, -1)))
 
-    print(f"  Step 1: Computing unstructured pruning target...")
-    # --- 步骤 1: 计算非结构化剪枝后的矩阵 B_unstructured ---
-    W_mask_unstructured = (torch.zeros_like(W_metric) == 1)
-    sort_res = torch.sort(W_metric, dim=-1, stable=True)
-    indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
-    W_mask_unstructured.scatter_(1, indices, True)
-    B_unstructured = original_weight.clone()
-    B_unstructured[W_mask_unstructured] = 0
-    print(f"    B_unstructured sparsity: {(B_unstructured == 0).float().mean():.6f}")
-
-
-
-    # --- 步骤 2: 计算2:4结构化剪枝后的矩阵 B_structured ---
-    print(f"  Step 2: Computing structured pruning result...")
-    # 计算结构化剪枝目标
-    W_mask_structured = (torch.zeros_like(W_metric) == 1)
-    if prune_n != 0:
-        for ii in range(W_metric.shape[1]):
-            if ii % prune_m == 0:
-                tmp = W_metric[:, ii:(ii + prune_m)].float()
-                W_mask_structured.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
-    else:
-        #如果没有指定n:m，则结构化掩码与非结构化掩码相同
-        W_mask_structured = W_mask_unstructured.clone()
-    B_structured = original_weight.clone()
-    B_structured[W_mask_structured] = 0     
-    print(f"    B_structured sparsity: {(B_structured == 0).float().mean():.6f}")
-
-
-    # --- 步骤 3: 计算补偿矩阵 ΔB ---
-    print(f"  Step 3: Computing compensation matrix (delta_B)...")
-    delta_B = B_unstructured - B_structured
-    # --- 步骤 4: 将 ΔB 转换为 CSR 格式 ---
-    compensation_params = None
-    if torch.norm(delta_B) > 1e-8:
-        print(f"  Step 4: Converting delta_B to CSR format...")
-
-        # 设置一个阈值，将非常接近零的数值彻底清零，以最大化稀疏性
-        threshold = 1e-8
-        delta_B[torch.abs(delta_B) < threshold] = 0.0
-
-        # 转换为 CSR 格式
-        delta_B_csr = delta_B.to_sparse_csr()
-
-        print(f"    Successfully converted. CSR non-zero elements: {delta_B_csr.values().numel()}")
-
-        # 准备要返回的补偿参数字典
-        layer_key = f"model.layers.{layer_index}.{layer_name}"
-        compensation_params = {
-            #考虑到 delta_B_csr 是高度稀疏的，额外占用的显存可能在可接受的范围内
-            'delta_B_csr': delta_B_csr,
-        }
-        print(f"    Compensation parameters for {layer_key} created.")
-
-        # 清理GPU内存
-        del delta_B_csr
-        torch.cuda.empty_cache()
-    else:
-        print(f"    No compensation needed (delta_B norm is too small).")
-
-
-    return B_structured, compensation_params
-        
 
 def find_layers(module, layers=[nn.Linear], name=''):
     """
@@ -402,8 +300,6 @@ def find_layers(module, layers=[nn.Linear], name=''):
     #下面是递归终止条件：
     if type(module) in layers:
         return {name: module}
-
-
     res = {}
     for name1, child in module.named_children(): #named_children返回当前所有直接子模块的迭代器
         #update将新的键值对添加到res字典中，如果键已存在，则更新其值
@@ -436,51 +332,151 @@ def check_sparsity(model):
         print(f"layer {i} sparsity {float(sub_count)/sub_params:.6f}")
 
     model.config.use_cache = use_cache 
-    return float(count)/total_params 
+    return float(count)/total_params
 
-def prepare_calibration_input(model, dataloader, device):
+
+def process_layer_compensation(layer_index, layer_name, original_weight, wrapped_layer, args, dev, prune_n=0,
+                               prune_m=0):
+    """处理单个层的补偿逻辑"""
+    print(f"Processing layer {layer_index} sublayer {layer_name}")
+
+    W_metric = torch.abs(original_weight) * torch.sqrt(wrapped_layer.scaler_row.reshape((1, -1)))
+
+    print(f"  Step 1: Computing unstructured pruning target...")
+    # --- 步骤 1: 计算非结构化剪枝后的矩阵 B_unstructured ---
+    W_mask_unstructured = (torch.zeros_like(W_metric) == 1)
+    sort_res = torch.sort(W_metric, dim=-1, stable=True)
+    indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
+    W_mask_unstructured.scatter_(1, indices, True)
+    B_unstructured = original_weight.clone()
+    B_unstructured[W_mask_unstructured] = 0
+    print(f"    B_unstructured sparsity: {(B_unstructured == 0).float().mean():.6f}")
+
+    # --- 步骤 2: 计算2:4结构化剪枝后的矩阵 B_structured ---
+    print(f"  Step 2: Computing structured pruning result...")
+    # 计算结构化剪枝目标
+    W_mask_structured = (torch.zeros_like(W_metric) == 1)
+    if prune_n != 0:
+        for ii in range(W_metric.shape[1]):
+            if ii % prune_m == 0:
+                tmp = W_metric[:, ii:(ii + prune_m)].float()
+                W_mask_structured.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
+    else:
+        # 如果没有指定n:m，则结构化掩码与非结构化掩码相同
+        W_mask_structured = W_mask_unstructured.clone()
+    B_structured = original_weight.clone()
+    B_structured[W_mask_structured] = 0
+    print(f"    B_structured sparsity: {(B_structured == 0).float().mean():.6f}")
+
+    # --- 步骤 3: 计算补偿矩阵 ΔB ---
+    print(f"  Step 3: Computing compensation matrix (delta_B)...")
+    delta_B = B_unstructured - B_structured
+    # --- 步骤 4: 将 ΔB 转换为 CSR 格式 ---
+    compensation_params = None
+    if torch.norm(delta_B) > 1e-8:
+        print(f"  Step 4: Converting delta_B to CSR format...")
+
+        # 设置一个阈值，将非常接近零的数值彻底清零，以最大化稀疏性
+        threshold = 1e-8
+        delta_B[torch.abs(delta_B) < threshold] = 0.0
+
+        # 转换为 CSR 格式
+        delta_B_csr = delta_B.to_sparse_csr()
+
+        print(f"    Successfully converted. CSR non-zero elements: {delta_B_csr.values().numel()}")
+
+        # 准备要返回的补偿参数字典
+        compensation_params = {
+            'delta_B_csr': delta_B_csr,
+        }
+        print(f"    Compensation parameters created.")
+
+        # 清理GPU内存
+        # del delta_B_csr
+        # torch.cuda.empty_cache()
+    else:
+        print(f"    No compensation needed (delta_B norm is too small).")
+
+    return B_structured, compensation_params
+
+
+
+
+def prepare_calibration_input(model, dataloader, nsamples, seqlen):
+    """
+    Prepare inputs for model calibration.
+
+    Args:
+        model (nn.Module): The model to prepare inputs for.
+        dataloader (DataLoader): DataLoader object to fetch input data.
+        device (torch.device): Device on which the model is loaded.
+
+    Returns:
+        inps (torch.Tensor): Input tensor for calibration.
+        outs (torch.Tensor): Output tensor for calibration.
+        attention_mask (torch.Tensor): Attention mask tensor.
+        position_ids (torch.Tensor): Position IDs tensor.
+    """
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.model.layers
-
-    # dev = model.hf_device_map["model.embed_tokens"]
-    # if "model.embed_tokens" in model.hf_device_map:
-    #     device = model.hf_device_map["model.embed_tokens"]
-
-    dtype = next(iter(model.parameters())).dtype #获取模型第一层(next函数)参数的数据类型
-    #hidden_size就是每一个token的向量表示的维度,原始数据是[batch_size, seq_len]，输入到模型经过词嵌入层，得到每个token的词嵌入向量表示
-    inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
+    try:
+        layers = model.model.layers
+    except AttributeError:
+        try:
+            layers = model.base_model.layers
+        except AttributeError:
+            layers = model.base_model.decoder.layers
+    if "model.embed_tokens" in getattr(model, 'hf_device_map', {}):
+        device = model.hf_device_map["model.embed_tokens"]
+    else:
+        device = model.device
+    dtype = next(iter(model.parameters())).dtype
+    # dtype = torch.float
+    inps = torch.zeros((nsamples, seqlen, model.config.hidden_size), dtype=dtype, device=device)
     inps.requires_grad = False
-    #下面i表示当前batch的索引
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'attention_mask': None, "position_ids": None, "cache_position": None, "position_embeddings": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
+            if hasattr(module, "self_attn"):
+                self.self_attn = module.self_attn
+            elif hasattr(module, "attn"):
+                self.attn = module.attn
+
         def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp #保存输入到预分配的inps中，捕获输入
-            cache['i'] += 1 #更新索引
+            inps[cache['i']] = inp
+            cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
-            raise ValueError #故意抛出异常，终止当前的forward函数后续计算
-    layers[0] = Catcher(layers[0]) #只捕获第一层的输入，layers是原模型层的引用，这里相当于把原模型第一层替换为Catcher类的实例，
+            if 'cache_position' in kwargs and 'position_embeddings' in kwargs:
+                cache['cache_position'] = kwargs['cache_position']
+                cache['position_embeddings'] = kwargs['position_embeddings']
+            raise ValueError
 
-    #替换的是大块的LlamaDecoderLayer(0)，正常情况是：output = layers[0](embedded, attention_mask, position_ids)
-    #现在变成Catcher(layers[0])(embedded, attention_mask, position_ids)
+    layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
-            model(batch[0].to(device)) #等价于：model.forward(batch[0].to(device)),进行前向传播
+            # model(torch.rand_like(batch[0].to(device)))
+            model(batch[0].to(device))
         except ValueError:
-            pass 
-    layers[0] = layers[0].module #再把Catcher类实例 恢复为 原模型的第一层
+            pass
+    layers[0] = layers[0].module
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
     model.config.use_cache = use_cache
 
-    return inps, outs, attention_mask, position_ids 
+    if 'cache_position' in cache and 'position_embeddings' in cache:
+        cache_position = cache['cache_position']
+        position_embeddings = cache['position_embeddings']
+        return inps, outs, attention_mask, position_ids, cache_position, position_embeddings
+    return inps, outs, attention_mask, position_ids
+
+
+
 
 def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     #alpha是剪枝比例因子
@@ -725,26 +721,19 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
 
 def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     """
-    执行带有补偿逻辑的Wanda剪枝并返回补偿参数
-    调用以下模块完成：
-    - analyze_activation_scales: 分析激活尺度
-    - plot_dense_matrix_experiment: 稠密矩阵实验
-    - smooth_and_compensate: 平滑处理
-    - analyze_delta_B_and_plot_svd: SVD分析和绘图
-    - process_layer_compensation: 处理单个层的补偿逻辑
+    执行带有补偿逻辑的Wanda剪枝，逐层替换模型层，直接返回最终模型
     """
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    
-    # 用于存储补偿参数的局部字典
-    compensation_params = {}
     
     print("loading calibration data")
     dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
     print("dataset loading complete")
 
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+        #inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+        returned_data = prepare_calibration_input(model, dataloader, args.nsamples, model.seqlen)
+        inps, outs, attention_mask, position_ids = returned_data[:4]
 
     layers = model.model.layers
     
@@ -753,11 +742,8 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
         layer = layers[i]
         subset = find_layers(layer)
 
-        # 设置设备，默认使用传入的device参数
+        # 设置设备
         dev = device
-        # if f"model.layers.{i}" in model.hf_device_map:
-        #     dev = model.hf_device_map[f"model.layers.{i}"]
-        #     inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
         if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
             inps = inps.to(dev)
@@ -766,7 +752,6 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
                 attention_mask = attention_mask.to(dev)
             if position_ids is not None:
                 position_ids = position_ids.to(dev)
-
 
         # 收集激活值
         wrapped_layers = {}
@@ -782,25 +767,15 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
         for name in wrapped_layers:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
-        # for j in range(args.nsamples):
-        #             with torch.no_grad():
-        #                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        # 1. 获取模型的位置编码模块
 
         rotary_emb = model.model.rotary_emb
-        #手动创建 position_ids (如果 prepare_calibration_input 返回了 None)
-        # 这是为了确保我们始终有一个有效的 position_ids 张量可以传递
         if position_ids is None:
             seq_len = inps.shape[1]
             position_ids = torch.arange(seq_len, device=dev).unsqueeze(0)
-        
+
         for j in range(args.nsamples):
             with torch.no_grad():
-                # 2. 为当前输入计算位置编码
-                #position_embeddings = rotary_emb(inps[j], seq_len=model.seqlen)
-                #新版本transformer库中，不再需要我们手动传入 seq_len,但需要position_ids
                 position_embeddings = rotary_emb(inps[j], position_ids)
-                # 3. 将计算好的位置编码传入 layer
                 outs[j] = layer(
                     inps[j].unsqueeze(0),
                     attention_mask=attention_mask,
@@ -811,7 +786,7 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
         for h in handles:
             h.remove()
 
-        # 对每个线性层进行剪枝
+        # 对每个线性层进行剪枝并立即替换
         for name in subset:
             original_weight = subset[name].weight.data.clone()
             
@@ -820,26 +795,26 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
                 i, name, original_weight, wrapped_layers[name], args, dev, prune_n, prune_m
             )
             
-            # 如果有补偿参数，保存到总的字典中
+            # 立即处理：要么替换为补偿层，要么设置稀疏权重
             if layer_compensation_params is not None:
-                layer_key = f"model.layers.{i}.{name}"
-                compensation_params[layer_key] = layer_compensation_params
+                print(f"Replacing layer: model.layers.{i}.{name}")
+                params = layer_compensation_params
+                new_layer = CompensatedSparseLinear(subset[name], params)
+                parent_name, child_name = name.rsplit('.', 1)
+                parent_module = model.get_submodule(f"model.layers.{i}.{parent_name}")
+                setattr(parent_module, child_name, new_layer)
 
-            # 线性层的权重被设置为纯粹的、稀疏的结构化剪枝结果
-            subset[name].weight.data = B_structured
-            print(f"    Layer weight is set to the sparse structured matrix.")
+                # 关键的内存泄漏修复
+                del params
+                del layer_compensation_params
+                print(f"    Compensated layer created.")
+            else:
+                subset[name].weight.data = B_structured
+                print(f"    Layer weight set to sparse structured matrix.")
 
-        # 重新计算层输出
-        # for j in range(args.nsamples):
-        #     with torch.no_grad():
-        #         outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        # inps, outs = outs, inps
         # 重新计算层输出
         for j in range(args.nsamples):
             with torch.no_grad():
-                # 同样需要计算并传入位置编码
-                #position_embeddings = rotary_emb(inps[j], seq_len=model.seqlen)
-                #新版本transformer库中，不再需要我们手动传入 seq_len
                 position_embeddings = rotary_emb(inps[j], position_ids)
                 outs[j] = layer(
                     inps[j].unsqueeze(0),
@@ -847,14 +822,18 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
                     position_ids=position_ids,
                     position_embeddings=position_embeddings
                 )[0]
+
         inps, outs = outs, inps
+        
+        # 简化的内存清理
+        del wrapped_layers
+        gc.collect()
+        torch.cuda.empty_cache()
 
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
-    
-    print("\n=== Wanda compensation parameter generation completed ===")
-    return compensation_params
-
+    print("\n=== Wanda compensation completed ===")
+    return model
 
 
 @torch.no_grad()
