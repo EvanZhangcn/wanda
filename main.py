@@ -44,6 +44,11 @@ def benchmark_performance(model, tokenizer, device, batch_size, num_repeats, seq
     print(f"Batch Size: {batch_size}, Repetitions: {num_repeats}, Sequence Length: {seq_len}")
     print("*" * 30)
 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        print(f"Set pad_token to eos_token: {tokenizer.pad_token}")
+
+
     # 1. 加载并预处理真实数据集
     print("Loading and preprocessing dataset for benchmark...")
     # 使用和您原始脚本相同的设置加载数据
