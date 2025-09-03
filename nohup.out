@@ -1,2 +1,44 @@
 Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:08<00:08,  8.60s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:11<00:00,  5.32s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:11<00:00,  5.81s/it]
 Terminal output has been saved to: ./logs/sanity_check_2-4.log
+torch 2.5.1
+transformers 4.55.4
+accelerate 1.10.0
+# of gpus:  4
+Traceback (most recent call last):
+  File "/data/zhangliwen/mc/wanda/main.py", line 255, in <module>
+    main()
+  File "/data/zhangliwen/mc/wanda/main.py", line 155, in main
+    assert args.sparsity_ratio == 0.5, "sparsity ratio must be 0.5 for structured N:M sparsity"
+AssertionError: sparsity ratio must be 0.5 for structured N:M sparsity
+Traceback (most recent call last):
+  File "/data/zhangliwen/mc/wanda/main.py", line 4, in <module>
+    import torch
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/__init__.py", line 2486, in <module>
+    from torch import _meta_registrations
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_meta_registrations.py", line 10, in <module>
+    from torch._decomp import (
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_decomp/__init__.py", line 249, in <module>
+    import torch._decomp.decompositions
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_decomp/decompositions.py", line 15, in <module>
+    import torch._prims as prims
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_prims/__init__.py", line 948, in <module>
+    trunc = _make_elementwise_unary_prim(
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_prims/__init__.py", line 491, in _make_elementwise_unary_prim
+    return _make_prim(
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_prims/__init__.py", line 319, in _make_prim
+    prim_def = torch.library.custom_op(
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_library/custom_ops.py", line 157, in custom_op
+    return inner(fn)
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_library/custom_ops.py", line 138, in inner
+    result = CustomOpDef(namespace, opname, schema_str, fn)
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_library/custom_ops.py", line 186, in __init__
+    self._register_to_dispatcher()
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_library/custom_ops.py", line 618, in _register_to_dispatcher
+    autograd_impl = autograd.make_autograd_impl(self._opoverload, self)
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_library/autograd.py", line 99, in make_autograd_impl
+    if any(
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_library/autograd.py", line 100, in <genexpr>
+    utils.is_tensorlist_like_type(a.type)
+  File "/data/zhangliwen/anaconda3/envs/wanda_final/lib/python3.9/site-packages/torch/_library/utils.py", line 113, in is_tensorlist_like_type
+    or typ == _C.ListType(_C.OptionalType(_C.TensorType.get()))
+KeyboardInterrupt
