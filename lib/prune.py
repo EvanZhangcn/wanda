@@ -472,6 +472,113 @@ def process_layer_compensation_dense(layer_index, layer_name, original_weight, w
 
     return B_structured, compensation_params
 
+
+def process_layer_selective_compensation(layer_index, layer_name, original_weight, wrapped_layer, args, dev, prune_n=0,
+                               prune_m=0):
+    """
+    处理单个层的选择性补偿逻辑.
+    仅补偿那些因结构化约束被移除、但根据Wanda分数评估为高重要性的权重子集.
+    """
+    print(f"Processing layer {layer_index} sublayer {layer_name} with SELECTIVE COMPENSATION")
+
+    # --- 通用步骤: 计算 Wanda score (W_metric) ---
+    W_metric = torch.abs(original_weight) * torch.sqrt(wrapped_layer.scaler_row.reshape((1, -1)))
+
+    # --- 步骤 1: 生成非结构化剪枝掩码 (Unstructured Pruning Mask) ---
+    # W_mask_unstructured 中为 True 的位置代表要被剪枝的权重
+    sort_res = torch.sort(W_metric, dim=-1, stable=True)
+    indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
+    W_mask_unstructured = torch.zeros_like(W_metric, dtype=torch.bool)
+    #指定的 indices 位置设为 True,代表要剪枝的权重
+    W_mask_unstructured.scatter_(1, indices, True)
+    # 取反得到Keep_mask_unstructured 中为 True 的位置代表在非结构化剪枝中要保留的权重
+    Keep_mask_unstructured = ~W_mask_unstructured
+    print(f"  Step 1: Unstructured mask generated.")
+
+
+    # --- 步骤 2: 生成结构化剪枝矩阵 (B_structured) 及对应掩码 ---
+    # W_mask_structured 中为 True 的位置代表要被剪枝的权重
+    W_mask_structured = torch.zeros_like(W_metric, dtype=torch.bool)
+    if prune_n != 0:
+        for ii in range(W_metric.shape[1]):
+            if ii % prune_m == 0:
+                tmp = W_metric[:, ii:(ii + prune_m)].float()
+                W_mask_structured.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
+    else:
+        # 如果没有指定n:m，则认为结构化和非结构化相同
+        W_mask_structured = W_mask_unstructured.clone()
+
+    B_structured = original_weight.clone()
+    B_structured[W_mask_structured] = 0
+    print(f"  Step 2: B_structured created (sparsity: {(B_structured == 0).float().mean():.4f}).")
+
+
+    # --- 步骤 3: 识别补偿候选权重 ---
+    # 候选权重是指：在非结构化标准下应保留(Keep_mask_unstructured=True)，但为满足结构化约束而被剪除(W_mask_structured=True)的权重。
+    compensation_candidate_mask = Keep_mask_unstructured & W_mask_structured
+    num_candidates = torch.sum(compensation_candidate_mask).item()
+    print(f"  Step 3: Identified {num_candidates} potential compensation candidates.")
+
+    if num_candidates == 0:
+        print("    No weights qualify for compensation. Skipping.")
+        return B_structured, None
+
+    # --- 步骤 4: 根据Wanda分数对候选权重进行排序 ---
+    candidate_wanda_scores = W_metric[compensation_candidate_mask]
+    
+    # 按降序排列，以优先补偿最重要的权重
+    sorted_scores, sorted_indices = torch.sort(candidate_wanda_scores, descending=True)
+    print(f"  Step 4: Ranked compensation candidates by Wanda score.")
+
+    # --- 步骤 5: 构建高稀疏度的补偿矩阵 (ΔB) ---
+    # 仅选择 Wanda 分数排名最高的 Top-K% 候选权重进行补偿
+    compensation_ratio = args.compensation_ratio
+    num_to_compensate = 0  # 默认不补偿
+
+    # 只有在补偿率大于0时才计算补偿数量
+    if compensation_ratio > 0:
+        num_to_compensate = int(num_candidates * compensation_ratio)
+
+        # 如果计算出的数量为0，但确实存在候选者，则至少补偿一个
+        if num_to_compensate == 0 and num_candidates > 0:
+            num_to_compensate = 1
+
+    print(f"  Step 5: Building sparse delta_B by compensating top {num_to_compensate} ({compensation_ratio:.2%}) candidates.")
+
+    # 获取分数最高的候选权重在一维列表中的索引
+    top_candidate_indices = sorted_indices[:num_to_compensate]
+
+    # 创建一个空的 ΔB 矩阵
+    delta_B = torch.zeros_like(original_weight)
+
+    # 我们需要候选权重在原始矩阵中的二维坐标来填充 ΔB
+    # `torch.where` 返回 (row_indices, col_indices) 元组
+    candidate_original_rows, candidate_original_cols = torch.where(compensation_candidate_mask)
+    
+    # 从所有候选者的坐标中，选出分数最高的那些
+    rows_to_compensate = candidate_original_rows[top_candidate_indices]
+    cols_to_compensate = candidate_original_cols[top_candidate_indices]
+
+    # 在 ΔB 中恢复这些被选中的权重值
+    delta_B[rows_to_compensate, cols_to_compensate] = original_weight[rows_to_compensate, cols_to_compensate]
+    
+    # --- 步骤 6: 封装补偿参数 ---
+    compensation_params = None
+    if torch.norm(delta_B) > 1e-8:
+        print(f"  Step 6: Converting sparse delta_B to CSR format...")
+        delta_B_csr = delta_B.to_sparse_csr()
+        compensation_params = {
+            'delta_B_csr': delta_B_csr,
+        }
+        print(f"    Compensation parameters created. Non-zero elements: {delta_B_csr.values().numel()}")
+    else:
+        print(f"    No compensation needed after selection (delta_B norm is too small).")
+
+    return B_structured, compensation_params
+
+
+
+
 def prepare_calibration_input(model, dataloader, nsamples, seqlen):
     """
     Prepare inputs for model calibration.
@@ -1134,7 +1241,121 @@ def prune_wanda_with_dense_compensation(args, model, tokenizer, device=torch.dev
     print("\n=== Wanda compensation completed ===")
     return model
 
+def prune_wanda_with_selective_compensation(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    """
+    执行带有选择性补偿逻辑的Wanda剪枝，逐层替换模型层，直接返回最终模型.
+    """
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
 
+    print("loading calibration data")
+    dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
+    print("dataset loading complete")
+
+    with torch.no_grad():
+        returned_data = prepare_calibration_input(model, dataloader, args.nsamples, model.seqlen)
+        inps, outs, attention_mask, position_ids = returned_data[:4]
+
+    layers = model.model.layers
+
+    for i in range(len(layers)):
+        print(f"\n=== Processing Layer {i} with Selective Compensation ===")
+        layer = layers[i]
+        subset = find_layers(layer)
+
+        # 设置设备
+        dev = device
+        if f"model.layers.{i}" in model.hf_device_map:
+            dev = model.hf_device_map[f"model.layers.{i}"]
+            inps = inps.to(dev)
+            outs = outs.to(dev)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(dev)
+            if position_ids is not None:
+                position_ids = position_ids.to(dev)
+
+        # 收集激活值
+        wrapped_layers = {}
+        for name in subset:
+            wrapped_layers[name] = WrappedGPT(subset[name])
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                wrapped_layers[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in wrapped_layers:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+
+
+        rotary_emb = model.model.rotary_emb
+        if position_ids is None:
+            seq_len = inps.shape[1]
+            position_ids = torch.arange(seq_len, device=dev).unsqueeze(0)
+
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                position_embeddings = rotary_emb(inps[j], position_ids)
+                outs[j] = layer(
+                    inps[j].unsqueeze(0),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings
+                )[0]
+
+        for h in handles:
+            h.remove()
+
+        # 对每个线性层进行剪枝并立即替换
+        for name in subset:
+            original_weight = subset[name].weight.data.clone()
+
+            # --- 核心区别: 调用新的 process_layer_selective_compensation 函数 ---
+            B_structured, layer_compensation_params = process_layer_selective_compensation(
+                i, name, original_weight, wrapped_layers[name], args, dev, prune_n, prune_m
+            )
+
+            # 立即处理：要么替换为补偿层，要么设置稀疏权重
+            if layer_compensation_params is not None:
+                print(f"Replacing layer: model.layers.{i}.{name}")
+                params = layer_compensation_params
+                new_layer = CompensatedSparseLinear(subset[name], params)
+                parent_name, child_name = name.rsplit('.', 1)
+                parent_module = model.get_submodule(f"model.layers.{i}.{parent_name}")
+                setattr(parent_module, child_name, new_layer)
+
+                # 关键的内存泄漏修复
+                del params
+                del layer_compensation_params
+                print(f"    Selectively compensated layer created.")
+            else:
+                subset[name].weight.data = B_structured
+                print(f"    Layer weight set to sparse structured matrix (no compensation).")
+
+        # 重新计算层输出
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                position_embeddings = rotary_emb(inps[j], position_ids)
+                outs[j] = layer(
+                    inps[j].unsqueeze(0),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings
+                )[0]
+
+        inps, outs = outs, inps
+
+        # 简化的内存清理
+        del wrapped_layers
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
+    print("\n=== Wanda selective compensation completed ===")
+    return model
+    
 
 @torch.no_grad()
 def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):

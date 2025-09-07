@@ -9,7 +9,8 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 
-from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers, prune_wanda_with_compensation, prune_wanda_with_2_4_compensation,prune_wanda_with_dense_compensation
+from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers, prune_wanda_with_compensation, prune_wanda_with_2_4_compensation,prune_wanda_with_dense_compensation,prune_wanda_with_selective_compensation
+
 from lib.eval import eval_ppl, eval_zero_shot
 
 print('torch', version('torch'))
@@ -130,8 +131,9 @@ def main():
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples.')
     parser.add_argument('--sparsity_ratio', type=float, default=0, help='Sparsity level')
     parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4"])
-    parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "wanda_compensation", "wanda_compensation_2_4", "wanda_compensation_dense", "sparsegpt",
-                    "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search"])
+    parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "wanda_compensation", "wanda_compensation_2_4", 
+                        "wanda_compensation_dense", "wanda_selective_compensation", "sparsegpt",
+                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
@@ -141,6 +143,8 @@ def main():
     parser.add_argument('--run_benchmark', action="store_true", help="Whether to run a performance benchmark after evaluation.")
     parser.add_argument('--benchmark_batch_size', type=int, default=1, help="Batch size for performance benchmark.")
     parser.add_argument('--benchmark_repeats', type=int, default=100, help="Number of repetitions for performance benchmark.")
+    parser.add_argument('--compensation_ratio', type=float, default=0.1, help='Ratio of mistaken weights to compensate for selective compensation.')
+
     #解析传入的参数，存入args
     args = parser.parse_args()
 
@@ -197,6 +201,12 @@ def main():
                 args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m
             )
             print("Final dense compensated model created.")
+        elif args.prune_method == "wanda_selective_compensation":
+            print("Generating final selectively compensated model...")
+            model = prune_wanda_with_selective_compensation(
+                args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m
+            )
+            print("Final selectively compensated model created.")    
         elif "ablate" in args.prune_method:
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
 
