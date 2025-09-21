@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 from kneed import KneeLocator
 import os
 import gc
+
+from pyarrow.types import is_struct
 from torch.sparse import to_sparse_semi_structured
 
 from .sparsegpt import SparseGPT 
@@ -19,9 +21,28 @@ from .ablate import AblateGPT
 # 用于存储补偿参数的局部字典（在函数内使用）
 # COMPENSATION_PAaRAMS 将在函数内部创建，避免全局状态
 
+def is_structured_sparse(matrix, n, m):
+    matrix_np = matrix.numpy()
+    rows, cols = matrix_np.shape
+    for i in range(rows):
+        row = matrix_np[i, :]
+        num_blocks_in_row = cols // m
+        for j in range(num_blocks_in_row):
+            block = row[j * m: (j + 1) * m]
+            non_zeros_in_block = np.count_nonzero(block)
+            if non_zeros_in_block > n:
+                return False
+    return True
+
 class CompensatedSparseLinear(nn.Module):
     def __init__(self, original_linear_layer, compensation_params):
         super().__init__()
+        #严重提醒：对传入参数：original_linear_layer进行检查，确保是稀疏的，而不是dense的
+        prune_n = compensation_params.get('prune_n', 0)
+        prune_m = compensation_params.get('prune_m', 0)
+        if prune_n > 0 and prune_m > 0:
+            temp_weight = original_linear_layer.weight.data
+            assert is_structured_sparse(temp_weight, n = prune_n, m = prune_m)
         # 基础层是稀疏的
         self.sparse_linear = original_linear_layer
         
@@ -43,6 +64,19 @@ class CompensatedSparseLinear(nn.Module):
 
             delta_B_csr_casted = self.delta_B_csr.to(device=x_2d.device, dtype=x.dtype)
             output_compensation = torch.sparse.mm(delta_B_csr_casted, x_2d.t()).t()
+
+            # # --- 核心修正：开始 ---
+            # # 1. 将输入和稀疏矩阵都强制转换为 FP32
+            # x_32 = x_2d.to(torch.float32)
+            # delta_B_csr_32 = self.delta_B_csr.to(torch.float32)
+            #
+            # # 2. 在 FP32 精度下执行稀疏矩阵乘法，避免数值下溢
+            # output_compensation_32 = torch.sparse.mm(delta_B_csr_32, x_32.t()).t()
+            #
+            # # 3. 将 FP32 的计算结果转换回原始数据类型 (FP16)，以便与另一分支相加
+            # output_compensation = output_compensation_32.to(output_sparse.dtype)
+            # # --- 核心修正：结束 ---
+
 
             # 将补偿输出重塑回原始输出形状
             if len(original_shape) > 2:
@@ -173,6 +207,11 @@ def analyze_delta_B_key_patterns(delta_B, layer_index, layer_name, save_dir="pat
     else:
         delta_B_np = delta_B
     
+    # 检查矩阵是否为空或全零
+    if delta_B_np.size == 0 or np.allclose(delta_B_np, 0, atol=1e-8):
+        print(f"    Warning: delta_B matrix is empty or all zeros, skipping analysis")
+        return None
+    
     # 创建2x2子图
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
     
@@ -203,9 +242,10 @@ def analyze_delta_B_key_patterns(delta_B, layer_index, layer_name, save_dir="pat
     ax2.grid(True, alpha=0.3)
     
     # 标注最重要的几行
-    top_rows = np.argsort(row_density)[-5:]  # 前5个最密集的行
-    for row_idx in top_rows:
-        ax2.axhline(y=row_idx, color='red', linestyle='--', alpha=0.7, linewidth=0.8)
+    if len(row_density) > 5:
+        top_rows = np.argsort(row_density)[-5:]  # 前5个最密集的行
+        for row_idx in top_rows:
+            ax2.axhline(y=row_idx, color='red', linestyle='--', alpha=0.7, linewidth=0.8)
     
     # 3. 列方向密度分析 - 查看是否某些输入特征更重要
     col_density = np.mean(nonzero_mask, axis=0)
@@ -217,9 +257,10 @@ def analyze_delta_B_key_patterns(delta_B, layer_index, layer_name, save_dir="pat
     ax3.grid(True, alpha=0.3)
     
     # 标注最重要的几列
-    top_cols = np.argsort(col_density)[-10:]  # 前10个最密集的列
-    for col_idx in top_cols:
-        ax3.axvline(x=col_idx, color='blue', linestyle='--', alpha=0.7, linewidth=0.8)
+    if len(col_density) > 10:
+        top_cols = np.argsort(col_density)[-10:]  # 前10个最密集的列
+        for col_idx in top_cols:
+            ax3.axvline(x=col_idx, color='blue', linestyle='--', alpha=0.7, linewidth=0.8)
     
     # 4. 统计摘要和模式结论
     ax4.axis('off')
@@ -227,8 +268,8 @@ def analyze_delta_B_key_patterns(delta_B, layer_index, layer_name, save_dir="pat
     # 计算关键统计量
     row_std = np.std(row_density)
     col_std = np.std(col_density)
-    max_row_density = np.max(row_density)
-    max_col_density = np.max(col_density)
+    max_row_density = np.max(row_density) if len(row_density) > 0 else 0
+    max_col_density = np.max(col_density) if len(col_density) > 0 else 0
     
     # 分析模式
     patterns = []
@@ -247,14 +288,14 @@ def analyze_delta_B_key_patterns(delta_B, layer_index, layer_name, save_dir="pat
         patterns.append("  → Input features equally important")
     
     # 查看是否有明显的聚集模式
-    if max_row_density > 3 * np.mean(row_density):
+    if max_row_density > 3 * np.mean(row_density) and np.mean(row_density) > 0:
         patterns.append("• HOTSPOT detected in output features")
-    if max_col_density > 3 * np.mean(col_density):
+    if max_col_density > 3 * np.mean(col_density) and np.mean(col_density) > 0:
         patterns.append("• HOTSPOT detected in input features")
     
     # 检查边缘vs中心模式
     edge_size = min(20, min(delta_B_np.shape) // 10)
-    if edge_size > 0:
+    if edge_size > 0 and delta_B_np.shape[0] > 2*edge_size and delta_B_np.shape[1] > 2*edge_size:
         center_density = np.mean(nonzero_mask[edge_size:-edge_size, edge_size:-edge_size])
         edge_density = (np.mean(nonzero_mask[:edge_size, :]) + 
                        np.mean(nonzero_mask[-edge_size:, :]) + 
@@ -276,12 +317,16 @@ Overall Sparsity: {sparsity:.3f} ({sparsity*100:.1f}%)
 DISTRIBUTION PATTERNS:
 {chr(10).join(patterns)}
 
-TOP AFFECTED FEATURES:
-• Most important output rows: {top_rows[-3:]}
-• Most important input cols: {top_cols[-5:]}
-
-CONCLUSION:
-"""
+TOP AFFECTED FEATURES:"""
+    
+    if len(row_density) > 3:
+        top_rows = np.argsort(row_density)[-3:]
+        summary_text += f"\n• Most important output rows: {top_rows}"
+    if len(col_density) > 5:
+        top_cols = np.argsort(col_density)[-5:]
+        summary_text += f"\n• Most important input cols: {top_cols}"
+    
+    summary_text += "\n\nCONCLUSION:\n"
     
     if row_std > 0.05 and col_std > 0.05:
         conclusion = "STRUCTURED compensation needed\n- Both input and output show selectivity"
@@ -577,6 +622,86 @@ def process_layer_selective_compensation(layer_index, layer_name, original_weigh
     return B_structured, compensation_params
 
 
+def process_layer_selective_compensation_dense(layer_index, layer_name, original_weight, wrapped_layer, args, dev,
+                                               prune_n=0,
+                                               prune_m=0):
+    """
+    处理单个层的选择性补偿逻辑，但返回稠密的 delta_B. (修正版)
+    """
+    # 这部分逻辑与CSR版本完全相同，直到最后一步
+
+    print(f"Processing layer {layer_index} sublayer {layer_name} with SELECTIVE DENSE COMPENSATION")
+
+    # --- 通用步骤: 计算 Wanda score (W_metric) ---
+    W_metric = torch.abs(original_weight) * torch.sqrt(wrapped_layer.scaler_row.reshape((1, -1)))
+
+    # --- 步骤 1: 生成非结构化剪枝掩码 (修正后的代码) ---
+    sort_res = torch.sort(W_metric, dim=-1, stable=True)
+    indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
+    W_mask_unstructured = torch.zeros_like(W_metric, dtype=torch.bool)
+    W_mask_unstructured.scatter_(1, indices, True)
+    Keep_mask_unstructured = ~W_mask_unstructured
+    print(f"  Step 1: Unstructured mask generated.")
+
+    # --- 步骤 2: 生成结构化剪枝矩阵 (B_structured) 及对应掩码 ---
+    W_mask_structured = torch.zeros_like(W_metric, dtype=torch.bool)
+    if prune_n != 0:
+        for ii in range(W_metric.shape[1]):
+            if ii % prune_m == 0:
+                tmp = W_metric[:, ii:(ii + prune_m)].float()
+                W_mask_structured.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
+    else:
+        W_mask_structured = W_mask_unstructured.clone()
+    B_structured = original_weight.clone()
+    B_structured[W_mask_structured] = 0
+    print(f"  Step 2: B_structured created (sparsity: {(B_structured == 0).float().mean():.4f}).")
+
+    # --- 步骤 3: 识别补偿候选权重 ---
+    compensation_candidate_mask = Keep_mask_unstructured & W_mask_structured
+    num_candidates = torch.sum(compensation_candidate_mask).item()
+    print(f"  Step 3: Identified {num_candidates} potential compensation candidates.")
+    if num_candidates == 0:
+        print("    No weights qualify for compensation. Skipping.")
+        return B_structured, None
+
+    # --- 步骤 4: 根据Wanda分数对候选权重进行排序 ---
+    candidate_wanda_scores = W_metric[compensation_candidate_mask]
+    sorted_scores, sorted_indices = torch.sort(candidate_wanda_scores, descending=True)
+    print(f"  Step 4: Ranked compensation candidates by Wanda score.")
+
+    # --- 步骤 5: 构建高稀疏度的补偿矩阵 (ΔB) ---
+    compensation_ratio = args.compensation_ratio
+    num_to_compensate = 0
+    if compensation_ratio > 0:
+        num_to_compensate = int(num_candidates * compensation_ratio)
+        if num_to_compensate == 0 and num_candidates > 0:
+            num_to_compensate = 1
+
+    print(
+        f"  Step 5: Building sparse delta_B by compensating top {num_to_compensate} ({compensation_ratio:.2%}) candidates.")
+
+    top_candidate_indices = sorted_indices[:num_to_compensate]
+    delta_B = torch.zeros_like(original_weight)
+    candidate_original_rows, candidate_original_cols = torch.where(compensation_candidate_mask)
+    rows_to_compensate = candidate_original_rows[top_candidate_indices]
+    cols_to_compensate = candidate_original_cols[top_candidate_indices]
+    delta_B[rows_to_compensate, cols_to_compensate] = original_weight[rows_to_compensate, cols_to_compensate]
+
+    # --- 步骤 6: 封装补偿参数 (核心区别) ---
+    compensation_params = None
+    if torch.norm(delta_B) > 1e-8:
+        print(
+            f"  Step 6: Created DENSE delta_B matrix for compensation. Non-zero elements: {torch.count_nonzero(delta_B)}")
+        # 直接返回稠密矩阵
+        compensation_params = {
+            'delta_B_dense': delta_B,
+        }
+    else:
+        print(f"    No compensation needed after selection.")
+
+    return B_structured, compensation_params
+
+
 
 
 def prepare_calibration_input(model, dataloader, nsamples, seqlen):
@@ -786,7 +911,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                     W_mask.scatter_(1, indices, True)
 
             #配合W_mask完成剪枝置0
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            subset[name].weight.data[W_mask] = 0 
 
 
         for j in range(args.nsamples):
@@ -972,6 +1097,7 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
                 i, name, original_weight, wrapped_layers[name], args, dev, prune_n, prune_m
             )
 
+            subset[name].weight.data = B_structured
             # 立即处理：要么替换为补偿层，要么设置稀疏权重
             if layer_compensation_params is not None:
                 print(f"Replacing layer: model.layers.{i}.{name}")
@@ -985,9 +1111,9 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
                 del params
                 del layer_compensation_params
                 print(f"    Compensated layer created.")
-            else:
-                subset[name].weight.data = B_structured
-                print(f"    Layer weight set to sparse structured matrix.")
+            #else:
+            #    subset[name].weight.data = B_structured
+            #    print(f"    Layer weight set to sparse structured matrix.")
 
         # 重新计算层输出
         for j in range(args.nsamples):
@@ -1129,6 +1255,7 @@ def prune_wanda_with_2_4_compensation(args, model, tokenizer, device=torch.devic
     torch.cuda.empty_cache()
     print("\n=== Wanda 2:4 compensation and layer replacement completed ===")
     return model
+
 
 def prune_wanda_with_dense_compensation(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     """
@@ -1311,10 +1438,13 @@ def prune_wanda_with_selective_compensation(args, model, tokenizer, device=torch
         for name in subset:
             original_weight = subset[name].weight.data.clone()
 
-            # --- 核心区别: 调用新的 process_layer_selective_compensation 函数 ---
+            # --- 注意：调用新的 process_layer_selective_compensation 函数 ---
             B_structured, layer_compensation_params = process_layer_selective_compensation(
                 i, name, original_weight, wrapped_layers[name], args, dev, prune_n, prune_m
             )
+
+            # 先将主干层的权重更新为结构化剪枝后的权重
+            subset[name].weight.data = B_structured
 
             # 立即处理：要么替换为补偿层，要么设置稀疏权重
             if layer_compensation_params is not None:
@@ -1329,9 +1459,6 @@ def prune_wanda_with_selective_compensation(args, model, tokenizer, device=torch
                 del params
                 del layer_compensation_params
                 print(f"    Selectively compensated layer created.")
-            else:
-                subset[name].weight.data = B_structured
-                print(f"    Layer weight set to sparse structured matrix (no compensation).")
 
         # 重新计算层输出
         for j in range(args.nsamples):
@@ -1356,6 +1483,119 @@ def prune_wanda_with_selective_compensation(args, model, tokenizer, device=torch
     print("\n=== Wanda selective compensation completed ===")
     return model
     
+
+def prune_wanda_with_selective_compensation_dense(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    """
+    执行带有选择性补偿的Wanda剪枝，但最终将补偿矩阵与结构化矩阵相加，形成一个最终的稠密权重.
+    环这种方法不使用自定义的并行计算层，而是直接修改权重，便于在不支持特定稀疏库的境中部署.
+    """
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    print("loading calibration data for DENSE selective compensation...")
+    dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
+    print("dataset loading complete")
+
+    with torch.no_grad():
+        returned_data = prepare_calibration_input(model, dataloader, args.nsamples, model.seqlen)
+        inps, outs, attention_mask, position_ids = returned_data[:4]
+
+    layers = model.model.layers
+
+    for i in range(len(layers)):
+        print(f"\n=== Processing Layer {i} with Selective DENSE Compensation ===")
+        layer = layers[i]
+        subset = find_layers(layer)
+
+        # 设置设备
+        dev = device
+        if f"model.layers.{i}" in model.hf_device_map:
+            dev = model.hf_device_map[f"model.layers.{i}"]
+            inps = inps.to(dev)
+            outs = outs.to(dev)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(dev)
+            if position_ids is not None:
+                position_ids = position_ids.to(dev)
+
+        # 收集激活值
+        wrapped_layers = {}
+        for name in subset:
+            wrapped_layers[name] = WrappedGPT(subset[name])
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                wrapped_layers[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in wrapped_layers:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+        
+        # rotary_emb 和 position_ids 的处理
+        rotary_emb = model.model.rotary_emb
+        if position_ids is None:
+            seq_len = inps.shape[1]
+            position_ids = torch.arange(seq_len, device=dev).unsqueeze(0)
+
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                # 注意: 根据您的模型实现，可能需要传递 position_embeddings
+                # 如果您的 prepare_calibration_input 返回了5或6个值, 这里需要相应调整
+                position_embeddings = rotary_emb(inps[j], position_ids)
+                outs[j] = layer(
+                    inps[j].unsqueeze(0),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings
+                )[0]
+
+        for h in handles:
+            h.remove()
+
+        # 对每个线性层进行剪枝并直接更新权重
+        for name in subset:
+            original_weight = subset[name].weight.data.clone()
+
+            # --- 核心区别 1: 调用新的 "dense" 内部函数 ---
+            B_structured, layer_compensation_params = process_layer_selective_compensation_dense(
+                i, name, original_weight, wrapped_layers[name], args, dev, prune_n, prune_m
+            )
+
+            # --- 核心区别 2: 直接相加并更新权重, 不使用自定义层 ---
+            if layer_compensation_params is not None:
+                delta_B = layer_compensation_params['delta_B_dense']
+                final_weight = B_structured + delta_B
+                print(f"Applying selective dense compensation to layer: model.layers.{i}.{name}")
+                subset[name].weight.data = final_weight
+            else:
+                subset[name].weight.data = B_structured
+                print(f"    Layer weight set to sparse structured matrix (no compensation).")
+
+        # 重新计算层输出以用于下一层的输入
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                position_embeddings = rotary_emb(inps[j], position_ids)
+                outs[j] = layer(
+                    inps[j].unsqueeze(0),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings
+                )[0]
+
+        inps, outs = outs, inps
+
+        # 简化的内存清理
+        del wrapped_layers
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
+    print("\n=== Wanda selective DENSE compensation completed ===")
+    return model
+
+
 
 @torch.no_grad()
 def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
@@ -1456,3 +1696,307 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
 
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
+
+
+# ============ 核范数优化2:4剪枝相关辅助函数 ============
+def prune_to_2_4_by_importance(matrix, importance):
+    """
+    基于 importance 矩阵进行 2:4 结构化剪枝
+    每 4 个元素的小组里，保留 importance 最大的 2 个，其他置零
+    修改为Wanda原版处理方式：忽略末尾不足4列的部分。
+    """
+    result = matrix.clone()
+    rows, cols = matrix.shape
+
+    prune_mask = torch.zeros_like(matrix, dtype=torch.bool)
+
+    prune_n, prune_m = 2, 4  # 每4个元素中保留2个
+
+    # 原版Wanda逻辑：只处理完整的4列块
+    for ii in range(0, cols - cols % prune_m, prune_m):
+        importance_block = importance[:, ii:ii+prune_m]
+        # 完整 4 列块，剪掉 importance 最小的 2 个
+        _, to_prune_indices = torch.topk(importance_block, prune_n, dim=1, largest=False)
+        prune_mask.scatter_(1, ii + to_prune_indices, True)
+
+    # 置零最不重要的元素
+    result[prune_mask] = 0
+
+    return result
+
+
+def prune_2_4_with_nuclear_norm_importance(W_unstructured, W_dense):
+    """
+    基于核范数subgradient的单步优化2:4剪枝。
+    该方法旨在找到一个2:4稀疏矩阵 W_main, 使得 ||W_unstructured - W_main||_* 最小化。
+    W_main 是通过对 W_dense 进行2:4剪枝得到的。
+
+    步骤:
+    1. 计算变化矩阵 ΔB = W_unstructured - W_dense。
+    2. 对 ΔB 进行SVD, 得到核范数的subgradient G = U @ Vh。
+    3. 计算重要性分数: importance = |ΔB * G|。
+    4. 使用此 importance 分数对 W_dense 进行2:4剪枝，得到最终的 W_main。
+
+    Args:
+        W_unstructured (torch.Tensor): 50%非结构化稀疏的目标矩阵。
+        W_dense (torch.Tensor): 原始的稠密矩阵。
+
+    Returns:
+        torch.Tensor: 经过核范数优化剪枝后的2:4稀疏矩阵。
+    """
+    print(f"  基于核范数 subgradient 的单步优化 2:4 剪枝...")
+    
+    # 1. 计算变化矩阵 ΔB = W_unstructured - W_dense
+    delta_B = W_unstructured - W_dense
+
+    try:
+        # 2. 对 ΔB 进行SVD, 得到 subgradient G
+        # 使用 float32 以提高 SVD 的稳定性
+        U, S, Vh = torch.linalg.svd(delta_B.to(torch.float32), full_matrices=False)
+        
+        # 核范数的 subgradient G = U @ Vh
+        G = (U @ Vh).to(W_dense.dtype)
+
+        # 3. 计算重要性分数: importance
+        importance = torch.abs(delta_B * G)
+    except RuntimeError as e:
+        print(f"    警告: SVD 失败 ({e})，回退到二阶近似 importance = |ΔB * ΔB|")
+        importance = torch.abs(delta_B * delta_B)
+
+    # 4. 使用新的 importance 分数对 W_dense 进行 2:4 结构化剪枝
+    W_main_optimized = prune_to_2_4_by_importance(W_dense, importance)
+
+    return W_main_optimized
+
+
+def calculate_delta_metrics(W_unstructured, W_main_pruned, svd_tolerance=1e-10):
+    """
+    计算 ΔB = W_unstructured - W_main_pruned 的核范数和有效秩。
+    有效秩通过过滤小于svd_tolerance的奇异值来计算。
+    """
+    delta_B = W_unstructured - W_main_pruned
+    
+    nuclear_norm_delta_B = torch.linalg.matrix_norm(delta_B, ord='nuc').item()
+
+    rank_delta_B = 0
+    try:
+        if torch.norm(delta_B) > 1e-12: # 避免对几乎为零的矩阵进行SVD
+            U, S_vals, Vh = torch.linalg.svd(delta_B, full_matrices=False)
+            effective_singular_values = S_vals[S_vals > svd_tolerance]
+            rank_delta_B = len(effective_singular_values)
+        else:
+            rank_delta_B = 0
+    except RuntimeError:
+        rank_delta_B = 0 # SVD计算失败时秩为0
+    
+    return rank_delta_B, nuclear_norm_delta_B
+
+
+def low_rank_approximation(matrix, k):
+    """
+    对输入矩阵做低秩近似（截断SVD），只保留前k个奇异值分量
+    Args:
+        matrix: 输入矩阵 (torch.Tensor)
+        k: 保留的秩
+    Returns:
+        低秩近似矩阵 (torch.Tensor)
+    """
+    original_device = matrix.device
+    try:
+        # 尝试在原设备上进行SVD
+        U, S, Vh = torch.linalg.svd(matrix, full_matrices=False)
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            print(f"    GPU内存不足，将SVD计算移到CPU: {e}")
+            # 移到CPU进行计算
+            matrix_cpu = matrix.cpu()
+            U, S, Vh = torch.linalg.svd(matrix_cpu, full_matrices=False)
+            # 将结果移回原设备
+            U = U.to(original_device)
+            S = S.to(original_device)
+            Vh = Vh.to(original_device)
+        else:
+            raise e
+    
+    # 只保留前k个奇异值
+    k = min(k, len(S))  # 确保k不超过矩阵的实际秩
+    S_trunc = torch.zeros_like(S)
+    S_trunc[:k] = S[:k]
+    approx = (U * S_trunc.unsqueeze(0)) @ Vh
+    return approx
+
+
+
+def wanda_unstructured_prune(matrix, scaler_row, sparsity_ratio=0.5):
+    """
+    使用Wanda重要性度量进行非结构化剪枝
+    Args:
+        matrix: 输入权重矩阵
+        scaler_row: 激活统计信息
+        sparsity_ratio: 稀疏率 (0.5表示50%稀疏)
+    """
+    # 计算Wanda重要性度量
+    W_metric = torch.abs(matrix) * torch.sqrt(scaler_row.reshape((1, -1)))
+    
+    # 计算需要剪枝的元素数量
+    total_elements = matrix.numel()
+    num_prune = int(total_elements * sparsity_ratio)
+    
+    # 找到重要性最小的元素进行剪枝
+    threshold = torch.kthvalue(W_metric.flatten(), num_prune).values
+    mask = W_metric <= threshold
+    
+    # 应用剪枝掩码
+    result = matrix.clone()
+    result[mask] = 0
+    
+    return result
+
+
+
+
+
+@torch.no_grad()
+def prune_wanda_nuclear_optimization(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    """
+    基于核范数优化的Wanda 2:4剪枝方法，带低秩补偿。
+    
+    算法流程：
+    1. 先用Wanda进行50%非结构化剪枝得到W_unstructured
+    2. 使用核范数优化方法，找到最优的2:4结构化剪枝矩阵W_nuclear_optimized
+    3. 计算ΔB = W_unstructured - W_nuclear_optimized
+    4. 对ΔB进行低秩近似得到ΔB_low_rank
+    5. 最终权重 = W_nuclear_optimized + ΔB_low_rank
+    
+    这样既保持了2:4稀疏结构的硬件加速优势，又通过低秩补偿保留了重要信息。
+    
+    Args:
+        args: 命令行参数，需要包含nuclear_low_rank_k参数（默认64）
+        model: 待剪枝的模型
+        tokenizer: 分词器
+        device: 设备
+        prune_n: 结构化剪枝参数n (应为2)
+        prune_m: 结构化剪枝参数m (应为4)
+    """
+    assert prune_n == 2 and prune_m == 4, "核范数优化方法目前只支持2:4剪枝"
+    
+    use_cache = model.config.use_cache 
+    model.config.use_cache = False 
+
+    print("loading calibration data")
+    dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
+    print("dataset loading complete")
+    
+    with torch.no_grad():
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+
+    layers = model.model.layers
+    
+    total_layers_processed = 0
+    total_nuclear_norm_improvement = 0.0
+    total_rank_improvement = 0
+    
+    for i in range(len(layers)):
+        print(f"\n=== Processing Layer {i} with Nuclear Norm Optimization ===")
+        layer = layers[i]
+        subset = find_layers(layer)
+
+        # 处理多GPU设备映射
+        if f"model.layers.{i}" in model.hf_device_map:
+            dev = model.hf_device_map[f"model.layers.{i}"]
+            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+
+        # 收集激活统计
+        wrapped_layers = {}
+        for name in subset:
+            wrapped_layers[name] = WrappedGPT(subset[name])
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                wrapped_layers[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in wrapped_layers:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+
+        # 移除钩子
+        for h in handles:
+            h.remove()
+
+        # 对每个线性层应用核范数优化剪枝
+        for name in subset:
+            print(f"  Processing layer {i}, module {name} with nuclear norm optimization")
+            
+            # 保存原始权重
+            W_dense = subset[name].weight.data.clone()
+            scaler_row = wrapped_layers[name].scaler_row
+            
+            # 步骤1: 先进行50%非结构化剪枝得到W_unstructured
+            print(f"    Step 1: Applying 50% unstructured pruning...")
+            W_unstructured = wanda_unstructured_prune(W_dense, scaler_row, sparsity_ratio=0.5)
+            
+            # 步骤2: 应用核范数优化的2:4剪枝
+            print(f"    Step 2: Applying nuclear norm optimized 2:4 pruning...")
+            W_nuclear_optimized = prune_2_4_with_nuclear_norm_importance(W_unstructured, W_dense)
+            
+            # 步骤3: 计算最终的ΔB并应用低秩近似补偿
+            print(f"    Step 3: Computing low-rank approximation compensation...")
+            final_delta_B = W_unstructured - W_nuclear_optimized
+            
+            # 获取低秩近似的秩参数，默认为64
+            low_rank_k = getattr(args, 'nuclear_low_rank_k', 64)
+            print(f"      Using low-rank approximation with k={low_rank_k}")
+            
+            # 应用低秩近似
+            delta_B_low_rank = low_rank_approximation(final_delta_B, low_rank_k)
+            
+            # 计算补偿后的最终权重
+            W_final_compensated = W_nuclear_optimized + delta_B_low_rank
+            
+            # 分析补偿效果
+            original_norm = torch.norm(final_delta_B).item()
+            approx_norm = torch.norm(delta_B_low_rank).item()
+            approximation_ratio = approx_norm / max(original_norm, 1e-8)
+            
+            # 计算核范数优化的效果
+            rank_optimized, nuc_norm_optimized = calculate_delta_metrics(W_unstructured, W_nuclear_optimized)
+            
+            print(f"    Results:")
+            print(f"      Nuclear optimized ΔB: rank={rank_optimized}, nuclear_norm={nuc_norm_optimized:.6f}")
+            print(f"      Original ΔB norm: {original_norm:.6f}")
+            print(f"      Low-rank approx norm: {approx_norm:.6f}")
+            print(f"      Approximation ratio: {approximation_ratio:.4f}")
+            
+            # 使用最终补偿后的权重
+            subset[name].weight.data = W_final_compensated
+            
+            total_layers_processed += 1
+            total_nuclear_norm_improvement += nuc_norm_optimized  # 记录核范数值而非改进量
+            total_rank_improvement += rank_optimized  # 记录秩值而非改进量
+
+        # 重新计算层输出
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+        
+        inps, outs = outs, inps
+        torch.cuda.empty_cache()
+
+    # 打印总体统计
+    print(f"\n=== Nuclear Norm Optimization Summary ===")
+    print(f"Total layers processed: {total_layers_processed}")
+    print(f"Average nuclear norm per layer: {total_nuclear_norm_improvement/max(total_layers_processed,1):.6f}")
+    print(f"Average rank per layer: {total_rank_improvement/max(total_layers_processed,1):.1f}")
+    print(f"Total nuclear norm sum: {total_nuclear_norm_improvement:.6f}")
+    print(f"Total rank sum: {total_rank_improvement}")
+
+    model.config.use_cache = use_cache 
+    torch.cuda.empty_cache()
+    print("Nuclear norm optimization with low-rank compensation completed!")
+    
+    return model
