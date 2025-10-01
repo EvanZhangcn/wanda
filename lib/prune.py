@@ -16,61 +16,104 @@ from .ablate import AblateGPT
 
 # 用于存储补偿参数的局部字典（在函数内使用）
 # COMPENSATION_PAaRAMS 将在函数内部创建，避免全局状态
+#
+# class CompensatedSparseLinear(nn.Module):
+#     def __init__(self, original_linear_layer, compensation_params):
+#         super().__init__()
+#         # 基础层是稀疏的
+#         self.sparse_linear = original_linear_layer
+#
+#         # 加载补偿参数
+#         self.L1 = nn.Parameter(compensation_params['L1'], requires_grad=False) # (out_features, rank)
+#         self.L2 = nn.Parameter(compensation_params['L2'], requires_grad=False)  # (rank, in_features)
+#         self.s_inv = nn.Parameter(compensation_params['s_inv'], requires_grad=False)
+#
+#     def forward(self, x):
+#             # 分支1: 原始的稀疏计算
+#             output_sparse = self.sparse_linear(x)
+#
+#             # 分支2: 并行的低秩补偿计算
+#             # 注意：x的形状可能是处理完整序列得到三维张量的 (batch_size, seq_len, input_dim)
+#             # 或 生成单个新词元得到二维张量的(batch_size*seq_len, input_dim)
+#             original_shape = x.shape
+#             # 为了健壮性加的，可以删除：将输入重塑为二维矩阵以便进行矩阵乘法
+#             if x.dim() > 2:
+#                 x_2d = x.view(-1, x.shape[-1])  # (batch_size*seq_len, input_dim)
+#             else:
+#                 x_2d = x
+#
+#             # 确保设备一致性并应用smoothing，同时确保数据类型一致
+#             x_smoothed = x_2d.to(self.s_inv.device, dtype=self.s_inv.dtype) * self.s_inv  # (batch*seq, in_features)
+#
+#             # 低秩补偿计算: x_smoothed @ (L1 @ L2)^T = x_smoothed @ L2^T @ L1^T
+#             # L2^T: (in_features, rank), L1^T: (rank, out_features)
+#             # 确保所有参数都在同一设备和数据类型
+#             L2_t = self.L2.t().to(x_smoothed.device, dtype=x_smoothed.dtype)
+#             L1_t = self.L1.t().to(x_smoothed.device, dtype=x_smoothed.dtype)
+#
+#             temp = x_smoothed @ L2_t   # (batch*seq, rank)
+#             output_compensation = temp @ L1_t  # (batch*seq, out_features)
+#
+#             # 将补偿输出重塑回原始输出形状
+#             if len(original_shape) > 2:
+#                 # 需要重塑为与output_sparse相同的形状
+#                 output_compensation = output_compensation.view(*original_shape[:-1], -1)
+#
+#             # 确保补偿输出与稀疏输出在同一设备和数据类型上
+#             output_compensation = output_compensation.to(output_sparse.device, dtype=output_sparse.dtype)
+#
+#             # 合并结果
+#             return output_sparse + output_compensation
+#
+#
+#     def to(self, *args, **kwargs):
+#         # 确保所有参数都被移动
+#         super().to(*args, **kwargs)
+#         self.sparse_linear.to(*args, **kwargs)
+#         return self
 
-class CompensatedSparseLinear(nn.Module):
-    def __init__(self, original_linear_layer, compensation_params):
+class LowRankLinear(nn.Module):
+    """A linear layer represented by low-rank factors with smoothing."""
+
+    def __init__(self, final_weight_factors, in_features, out_features):
         super().__init__()
-        # 基础层是稀疏的
-        self.sparse_linear = original_linear_layer
-        
-        # 加载补偿参数
-        self.L1 = nn.Parameter(compensation_params['L1'], requires_grad=False) # (out_features, rank)
-        self.L2 = nn.Parameter(compensation_params['L2'], requires_grad=False)  # (rank, in_features)
-        self.s_inv = nn.Parameter(compensation_params['s_inv'], requires_grad=False)
-        
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Load the low-rank factors and inverse scaling factor
+        self.L1 = nn.Parameter(final_weight_factors['L1'], requires_grad=False)  # (out_features, rank)
+        self.L2 = nn.Parameter(final_weight_factors['L2'], requires_grad=False)  # (rank, in_features)
+        self.s_inv = nn.Parameter(final_weight_factors['s_inv'], requires_grad=False)  # (1, in_features)
+
     def forward(self, x):
-            # 分支1: 原始的稀疏计算
-            output_sparse = self.sparse_linear(x)
+        # The forward pass computes: (x * s_inv) @ (L1 @ L2)^T
+        original_shape = x.shape
+        if x.dim() > 2:
+            x = x.view(-1, x.shape[-1])
 
-            # 分支2: 并行的低秩补偿计算
-            # 注意：x的形状可能是处理完整序列得到三维张量的 (batch_size, seq_len, input_dim) 
-            # 或 生成单个新词元得到二维张量的(batch_size*seq_len, input_dim)
-            original_shape = x.shape
-            # 为了健壮性假的，可以删除：将输入重塑为二维矩阵以便进行矩阵乘法
-            if x.dim() > 2:
-                x_2d = x.view(-1, x.shape[-1])  # (batch_size*seq_len, input_dim)
-            else:
-                x_2d = x
-                
-            # 确保设备一致性并应用smoothing，同时确保数据类型一致
-            x_smoothed = x_2d.to(self.s_inv.device, dtype=self.s_inv.dtype) * self.s_inv  # (batch*seq, in_features)
-            
-            # 低秩补偿计算: x_smoothed @ (L1 @ L2)^T = x_smoothed @ L2^T @ L1^T
-            # L2^T: (in_features, rank), L1^T: (rank, out_features)
-            # 确保所有参数都在同一设备和数据类型
-            L2_t = self.L2.t().to(x_smoothed.device, dtype=x_smoothed.dtype)
-            L1_t = self.L1.t().to(x_smoothed.device, dtype=x_smoothed.dtype)
-            
-            temp = x_smoothed @ L2_t   # (batch*seq, rank)
-            output_compensation = temp @ L1_t  # (batch*seq, out_features)
-            
-            # 将补偿输出重塑回原始输出形状
-            if len(original_shape) > 2:
-                # 需要重塑为与output_sparse相同的形状
-                output_compensation = output_compensation.view(*original_shape[:-1], -1)
-            
-            # 确保补偿输出与稀疏输出在同一设备和数据类型上
-            output_compensation = output_compensation.to(output_sparse.device, dtype=output_sparse.dtype)
-            
-            # 合并结果
-            return output_sparse + output_compensation
+        # Ensure device and dtype consistency
+        target_device = self.L1.device
+        target_dtype = self.L1.dtype
+        x = x.to(target_device, dtype=target_dtype)
 
+        # Apply smoothing to the input activation
+        x_smoothed = x * self.s_inv
+
+        # Perform the low-rank matrix multiplication
+        # (x @ L2^T) @ L1^T
+        output = (x_smoothed @ self.L2.t()) @ self.L1.t()
+
+        # Reshape output to match the original shape's batch/sequence dimensions
+        if len(original_shape) > 2:
+            output = output.view(*original_shape[:-1], self.out_features)
+
+        return output
 
     def to(self, *args, **kwargs):
-        # 确保所有参数都被移动
         super().to(*args, **kwargs)
-        self.sparse_linear.to(*args, **kwargs)
         return self
+
+
 
 def create_final_compensated_model(structured_model, compensation_params):
     # 遍历模型的所有模块
@@ -110,16 +153,17 @@ def calculate_smoothing_scale_factor(activation_scales, delta_B, alpha=0.5):
     """
     # 计算 delta_B 每一列的绝对值最大值
     # 对应 SmoothQuant 论文中的 max(|W_j|)
-    delta_B_input_channel_max_abs = torch.max(torch.abs(delta_B), dim=0, keepdim=True)[0]
+    delta_B_input_channel_max_abs = torch.max(torch.abs(delta_B), dim=0, keepdim=True)[0].clamp(min=1e-5)
 
     # 平滑公式
     # 为了防止除零，添加一个小的epsilon
-    epsilon = 1e-6
-    s = torch.pow(activation_scales, alpha) / (torch.pow(delta_B_input_channel_max_abs, 1 - alpha) + epsilon)
-    
+    #epsilon = 1e-6
+    #s = torch.pow(activation_scales, alpha) / (torch.pow(delta_B_input_channel_max_abs, 1 - alpha) + epsilon)
+    #s = torch.pow(activation_scales, alpha) / (torch.pow(delta_B_input_channel_max_abs, 1 - alpha))
+    s = torch.pow(activation_scales, alpha)
     # 如果一个通道在 delta_B 中全为零，
     # 那么它的缩放因子应该为1，即不进行缩放。
-    s[delta_B_input_channel_max_abs == 0] = 1.0
+    #s[delta_B_input_channel_max_abs == 0] = 1.0
 
 
     # 对s进行裁剪，防止出现极端值
@@ -615,183 +659,240 @@ CONCLUSION:
     
     return filepath
 
+#
+# def process_layer_compensation(layer_index, layer_name, original_weight, wrapped_layer, args, dev, prune_n=0, prune_m=0):
+#     """处理单个层的补偿逻辑"""
+#     print(f"Processing layer {layer_index} sublayer {layer_name}")
+#
+#     W_metric = torch.abs(original_weight) * torch.sqrt(wrapped_layer.scaler_row.reshape((1, -1)))
+#
+#     print(f"  Step 1: Computing unstructured pruning target...")
+#     # 计算非结构化剪枝目标
+#     W_mask_unstructured = (torch.zeros_like(W_metric) == 1)
+#     sort_res = torch.sort(W_metric, dim=-1, stable=True)
+#     indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
+#     W_mask_unstructured.scatter_(1, indices, True)
+#
+#     B_unstructured = original_weight.clone()
+#     B_unstructured[W_mask_unstructured] = 0
+#     print(f"    B_unstructured sparsity: {(B_unstructured == 0).float().mean():.6f}")
+#
+#
+#     print(f"  Step 2: Computing structured pruning result...")
+#     # 计算结构化剪枝目标
+#     W_mask_structured = (torch.zeros_like(W_metric) == 1)
+#     if prune_n != 0:
+#         for ii in range(W_metric.shape[1]):
+#             if ii % prune_m == 0:
+#                 tmp = W_metric[:, ii:(ii + prune_m)].float()
+#                 W_mask_structured.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
+#     else:
+#         # 如果没有指定n:m，则结构化掩码与非结构化掩码相同
+#         W_mask_structured = W_mask_unstructured.clone()
+#
+#     B_structured = original_weight.clone()
+#     B_structured[W_mask_structured] = 0
+#     print(f"    B_structured sparsity: {(B_structured == 0).float().mean():.6f}")
+#
+#     print(f"  Step 3: Computing compensation matrix (delta_B)...")
+#     delta_B = B_unstructured - B_structured
+#
+#     # ======================= 在这里添加 N:M 分析调用 =======================
+#     print(f"\n  Step 3a: Analyzing N:M sparsity compliance for delta_B...")
+#
+#     # 调用您想测试的N:M组合
+#     # 检查行维度上的 2:4 稀疏满足度
+#     #check_nm_sparsity_ratio(delta_B, n=2, m=4, dimension='row')
+#
+#     # 检查行维度上的 4:8 稀疏满足度
+#     #check_nm_sparsity_ratio(delta_B, n=4, m=8, dimension='row')
+#
+#     # 您还可以添加其他想测试的组合
+#     print("-" * 50)
+#     # ====================================================================
+#
+#     # ======================= 新增：生成delta_B的spy图 =======================
+#     #print(f"  Step 3b: Analyzing key patterns in delta_B matrix...")
+#     #analyze_delta_B_key_patterns(delta_B, layer_index, layer_name)
+#     # ====================================================================
+#
+#     compensation_params = None
+#
+#     if torch.norm(delta_B) > 1e-8:
+#         print(f"  Step 3a: Applying Smoothing to delta_B...")
+#
+#         try:
+#             # 1. 获取激活尺度
+#             activation_scales = wrapped_layer.act_scales.to(dev)
+#
+#             # 分析激活尺度
+#             analyze_activation_scales(activation_scales, layer_index, layer_name)
+#
+#             # 确保activation_scales是正确的形状 (1, in_features)
+#             if activation_scales.dim() == 1:
+#                 activation_scales = activation_scales.unsqueeze(0)
+#
+#             # 稠密矩阵实验
+#             #plot_dense_matrix_experiment(layer_index, layer_name, original_weight, activation_scales, args)
+#
+#             # ======================= 任务三：新增的核心假说验证代码块 开始 =======================
+#             """
+#             print("\n  [TASK 3 ANALYSIS] Correlating activation scales with zero-columns in delta_B...")
+#
+#             # 1. 找到 activation_scales 最大的 Top-K 通道的索引
+#             top_k = 50  # 我们可以关注最重要的50个通道
+#             s_flat = activation_scales.flatten()
+#             top_k_scales_val, top_k_scales_indices = torch.topk(s_flat, top_k)
+#
+#             # 2. 找到 delta_B 中所有全零列的索引
+#             delta_B_col_max_abs = torch.max(torch.abs(delta_B), dim=0)[0]
+#             zero_col_indices = torch.where(delta_B_col_max_abs == 0)[0]
+#
+#             # 3. 量化分析: 计算重合度
+#             # 将索引转换为集合(set)以便快速查找
+#             zero_col_set = set(zero_col_indices.cpu().numpy())
+#             top_k_set = set(top_k_scales_indices.cpu().numpy())
+#
+#             overlap_indices = top_k_set.intersection(zero_col_set)
+#             overlap_count = len(overlap_indices)
+#
+#             print(f"  - Analysis Result: Out of the Top {top_k} most important channels (by activation scale):")
+#             print(
+#                 f"  - {overlap_count} ({overlap_count / top_k * 100:.2f}%) of them correspond to an all-zero column in delta_B.")
+#
+#             if overlap_count / top_k > 0.5:  # 如果超过一半都重合，说明假说很可能成立
+#                 print("  - [!!] CRITICAL FINDING: A significant overlap was found. The hypothesis is likely correct.")
+#             else:
+#                 print("  - NOTE: The overlap is not significant.")
+#
+#             # 4. 可视化分析: 绘制相关性散点图
+#             print("  - Generating correlation scatter plot for Task 3...")
+#
+#             # 准备绘图数据
+#             x_data = activation_scales.flatten().cpu().numpy()
+#             y_data = delta_B_col_max_abs.cpu().numpy()
+#
+#             # 创建图纸
+#             fig, ax = plt.subplots(figsize=(12, 8))
+#
+#             # 绘制散点图
+#             ax.scatter(x_data, y_data, alpha=0.5, s=10)
+#
+#             ax.set_yscale('log')
+#             ax.set_xlabel('Activation Scale Value (Per-Input-Channel)', fontsize=12)
+#             ax.set_ylabel('Max Abs Value of delta_B Column (log scale)', fontsize=12)
+#             ax.set_title(
+#                 f'Correlation between Activation Scales and delta_B Column Norms\nLayer {layer_index} - {layer_name}',
+#                 fontsize=16)
+#             ax.grid(True, which="both", ls="--", linewidth=0.5)
+#
+#             # 保存图表
+#             scatter_save_dir = "correlation_analysis_plots"
+#             os.makedirs(scatter_save_dir, exist_ok=True)
+#             scatter_filepath = os.path.join(scatter_save_dir,
+#                                             f"corr_layer_{layer_index}_{layer_name.replace('.', '_')}.png")
+#             plt.savefig(scatter_filepath)
+#             plt.close(fig)
+#             print(f"  - Correlation plot saved to: {scatter_filepath}\n")
+#             # ======================= 任务三：验证代码块 结束 =======================
+#             """
+#
+#             # 平滑处理
+#             delta_B_smoothed, s_inv = smooth_and_compensate(delta_B, activation_scales, args)
+#
+#             # 分析和绘图
+#             #analyze_delta_B_and_plot_svd(delta_B, delta_B_smoothed, layer_index, layer_name)
+#
+#             # 清理中间变量以节省内存
+#             del activation_scales
+#             torch.cuda.empty_cache()
+#
+#             # 计算低秩因子
+#             print(f"  Step 4: Computing low-rank factors...")
+#             compensation_rank = getattr(args, 'compensation_rank', None)
+#
+#             if compensation_rank is None:
+#                 compensation_rank = min(delta_B_smoothed.shape[0], delta_B_smoothed.shape[1]) // 4
+#
+#             L1, L2 = low_rank_approximation_factors(delta_B_smoothed, rank=compensation_rank)
+#
+#             # 保存参数
+#             layer_key = f"model.layers.{layer_index}.{layer_name}"
+#             compensation_params = {
+#                 'L1': L1.cpu(),      # 移到CPU以节省GPU内存
+#                 'L2': L2.cpu(),
+#                 's_inv': s_inv.cpu()
+#             }
+#             print(f"    Compensation parameters for {layer_key} have been generated and stored.")
+#
+#             # 清理GPU内存
+#             del L1, L2, s_inv, delta_B_smoothed
+#             torch.cuda.empty_cache()
+#
+#         except Exception as e:
+#             print(f"    Error in smoothing/compensation: {e}")
+#             print(f"    Skipping compensation for this layer.")
+#     else:
+#         print(f"    No compensation needed (delta_B norm is too small).")
+#
+#     return B_structured, compensation_params
+#
 
 def process_layer_compensation(layer_index, layer_name, original_weight, wrapped_layer, args, dev, prune_n=0, prune_m=0):
-    """处理单个层的补偿逻辑"""
-    print(f"Processing layer {layer_index} sublayer {layer_name}")
-    
-    W_metric = torch.abs(original_weight) * torch.sqrt(wrapped_layer.scaler_row.reshape((1, -1)))
+    """
+    Directly applies smoothing and SVD to the dense weight matrix (W_dense).
+    """
+    print(f"Processing layer {layer_index} sublayer {layer_name} with new SVD logic")
 
-    print(f"  Step 1: Computing unstructured pruning target...")
-    # 计算非结构化剪枝目标
-    W_mask_unstructured = (torch.zeros_like(W_metric) == 1)
-    sort_res = torch.sort(W_metric, dim=-1, stable=True)
-    indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
-    W_mask_unstructured.scatter_(1, indices, True)
+    final_weight_factors = None
 
-    B_unstructured = original_weight.clone()
-    B_unstructured[W_mask_unstructured] = 0
-    print(f"    B_unstructured sparsity: {(B_unstructured == 0).float().mean():.6f}")
+    try:
+        # Step 1: Get activation scales for smoothing.
+        print(f"  Step 1: Retrieving activation scales...")
+        activation_scales = wrapped_layer.act_scales.to(dev)
 
-    print(f"  Step 2: Computing structured pruning result...")
-    # 计算结构化剪枝目标
-    W_mask_structured = (torch.zeros_like(W_metric) == 1)
-    if prune_n != 0:
-        for ii in range(W_metric.shape[1]):
-            if ii % prune_m == 0:
-                tmp = W_metric[:, ii:(ii + prune_m)].float()
-                W_mask_structured.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
-    else:
-        # 如果没有指定n:m，则结构化掩码与非结构化掩码相同
-        W_mask_structured = W_mask_unstructured.clone()
+        if activation_scales.dim() == 1:
+            activation_scales = activation_scales.unsqueeze(0)
 
-    B_structured = original_weight.clone()
-    B_structured[W_mask_structured] = 0     
-    print(f"    B_structured sparsity: {(B_structured == 0).float().mean():.6f}")
+        # Step 2: Apply smoothing to the original dense weight matrix.
+        # We reuse `smooth_and_compensate` but pass `original_weight` instead of `delta_B`.
+        print(f"  Step 2: Applying smoothing to the dense weight matrix...")
+        W_dense_smoothed, s_inv = smooth_and_compensate(original_weight, activation_scales, args)
+        print(f"    Smoothing complete.")
 
-    print(f"  Step 3: Computing compensation matrix (delta_B)...")
-    delta_B = B_unstructured - B_structured
+        # Clean up memory
+        del activation_scales
+        torch.cuda.empty_cache()
 
-    # ======================= 在这里添加 N:M 分析调用 =======================
-    print(f"\n  Step 3a: Analyzing N:M sparsity compliance for delta_B...")
-
-    # 调用您想测试的N:M组合
-    # 检查行维度上的 2:4 稀疏满足度
-    check_nm_sparsity_ratio(delta_B, n=2, m=4, dimension='row')
-
-    # 检查行维度上的 4:8 稀疏满足度
-    check_nm_sparsity_ratio(delta_B, n=4, m=8, dimension='row')
-
-    # 您还可以添加其他想测试的组合
-    print("-" * 50)
-    # ====================================================================
-
-    # ======================= 新增：生成delta_B的spy图 =======================
-    print(f"  Step 3b: Analyzing key patterns in delta_B matrix...")
-    analyze_delta_B_key_patterns(delta_B, layer_index, layer_name)
-    # ====================================================================
-
-    compensation_params = None
-    
-    if torch.norm(delta_B) > 1e-8:
-        print(f"  Step 3a: Applying Smoothing to delta_B...")
+        # Step 3: Compute low-rank factors using SVD.
+        print(f"  Step 3: Computing low-rank factors via SVD...")
+        # You can control the rank via an argument, e.g., args.compensation_rank
+        final_rank = getattr(args, 'compensation_rank', 64) # 如果没拿到，最后一个参数64作为默认值
+        print(f"    Target rank for final weight: {final_rank}")
         
-        try:
-            # 1. 获取激活尺度
-            activation_scales = wrapped_layer.act_scales.to(dev)
-            
-            # 分析激活尺度
-            analyze_activation_scales(activation_scales, layer_index, layer_name)
-            
-            # 确保activation_scales是正确的形状 (1, in_features)
-            if activation_scales.dim() == 1:
-                activation_scales = activation_scales.unsqueeze(0)
-            
-            # 稠密矩阵实验
-            #plot_dense_matrix_experiment(layer_index, layer_name, original_weight, activation_scales, args)
+        L1, L2 = low_rank_approximation_factors(W_dense_smoothed, rank=final_rank)
 
-            # ======================= 任务三：新增的核心假说验证代码块 开始 =======================
-            """
-            print("\n  [TASK 3 ANALYSIS] Correlating activation scales with zero-columns in delta_B...")
+        # Store the factors that will represent the entire layer.
+        layer_key = f"model.layers.{layer_index}.{layer_name}"
+        final_weight_factors = {
+            'L1': L1.cpu(),
+            'L2': L2.cpu(),
+            's_inv': s_inv.cpu()
+        }
+        print(f"    Low-rank factors for {layer_key} have been generated and stored.")
 
-            # 1. 找到 activation_scales 最大的 Top-K 通道的索引
-            top_k = 50  # 我们可以关注最重要的50个通道
-            s_flat = activation_scales.flatten()
-            top_k_scales_val, top_k_scales_indices = torch.topk(s_flat, top_k)
+        # Clean up GPU memory
+        del L1, L2, s_inv, W_dense_smoothed
+        torch.cuda.empty_cache()
 
-            # 2. 找到 delta_B 中所有全零列的索引
-            delta_B_col_max_abs = torch.max(torch.abs(delta_B), dim=0)[0]
-            zero_col_indices = torch.where(delta_B_col_max_abs == 0)[0]
+    except Exception as e:
+        print(f"    An error occurred during smoothing or SVD for layer {layer_name}: {e}")
+        print(f"    Skipping factorization for this layer.")
 
-            # 3. 量化分析: 计算重合度
-            # 将索引转换为集合(set)以便快速查找
-            zero_col_set = set(zero_col_indices.cpu().numpy())
-            top_k_set = set(top_k_scales_indices.cpu().numpy())
+    # Return None for the first value (as there's no B_structured) and the new factors.
+    return None, final_weight_factors
 
-            overlap_indices = top_k_set.intersection(zero_col_set)
-            overlap_count = len(overlap_indices)
 
-            print(f"  - Analysis Result: Out of the Top {top_k} most important channels (by activation scale):")
-            print(
-                f"  - {overlap_count} ({overlap_count / top_k * 100:.2f}%) of them correspond to an all-zero column in delta_B.")
-
-            if overlap_count / top_k > 0.5:  # 如果超过一半都重合，说明假说很可能成立
-                print("  - [!!] CRITICAL FINDING: A significant overlap was found. The hypothesis is likely correct.")
-            else:
-                print("  - NOTE: The overlap is not significant.")
-
-            # 4. 可视化分析: 绘制相关性散点图
-            print("  - Generating correlation scatter plot for Task 3...")
-
-            # 准备绘图数据
-            x_data = activation_scales.flatten().cpu().numpy()
-            y_data = delta_B_col_max_abs.cpu().numpy()
-
-            # 创建图纸
-            fig, ax = plt.subplots(figsize=(12, 8))
-
-            # 绘制散点图
-            ax.scatter(x_data, y_data, alpha=0.5, s=10)
-
-            ax.set_yscale('log')
-            ax.set_xlabel('Activation Scale Value (Per-Input-Channel)', fontsize=12)
-            ax.set_ylabel('Max Abs Value of delta_B Column (log scale)', fontsize=12)
-            ax.set_title(
-                f'Correlation between Activation Scales and delta_B Column Norms\nLayer {layer_index} - {layer_name}',
-                fontsize=16)
-            ax.grid(True, which="both", ls="--", linewidth=0.5)
-
-            # 保存图表
-            scatter_save_dir = "correlation_analysis_plots"
-            os.makedirs(scatter_save_dir, exist_ok=True)
-            scatter_filepath = os.path.join(scatter_save_dir,
-                                            f"corr_layer_{layer_index}_{layer_name.replace('.', '_')}.png")
-            plt.savefig(scatter_filepath)
-            plt.close(fig)
-            print(f"  - Correlation plot saved to: {scatter_filepath}\n")
-            # ======================= 任务三：验证代码块 结束 =======================
-            """
-            
-            # 平滑处理
-            delta_B_smoothed, s_inv = smooth_and_compensate(delta_B, activation_scales, args)
-            
-            # 分析和绘图
-            #analyze_delta_B_and_plot_svd(delta_B, delta_B_smoothed, layer_index, layer_name)
-            
-            # 清理中间变量以节省内存
-            del activation_scales
-            torch.cuda.empty_cache()
-            
-            # 计算低秩因子
-            print(f"  Step 4: Computing low-rank factors...")
-            compensation_rank = getattr(args, 'compensation_rank', None)
-            
-            if compensation_rank is None:
-                compensation_rank = min(delta_B_smoothed.shape[0], delta_B_smoothed.shape[1]) // 4
-            
-            L1, L2 = low_rank_approximation_factors(delta_B_smoothed, rank=compensation_rank)
-
-            # 保存参数
-            layer_key = f"model.layers.{layer_index}.{layer_name}"
-            compensation_params = {
-                'L1': L1.cpu(),      # 移到CPU以节省GPU内存
-                'L2': L2.cpu(),
-                's_inv': s_inv.cpu()
-            }
-            print(f"    Compensation parameters for {layer_key} have been generated and stored.")
-            
-            # 清理GPU内存
-            del L1, L2, s_inv, delta_B_smoothed
-            torch.cuda.empty_cache()
-            
-        except Exception as e:
-            print(f"    Error in smoothing/compensation: {e}")
-            print(f"    Skipping compensation for this layer.")
-    else:
-        print(f"    No compensation needed (delta_B norm is too small).")
-
-    return B_structured, compensation_params
-        
 
 def find_layers(module, layers=[nn.Linear], name=''):
     """
@@ -844,49 +945,79 @@ def check_sparsity(model):
     model.config.use_cache = use_cache 
     return float(count)/total_params 
 
-def prepare_calibration_input(model, dataloader, device):
+def prepare_calibration_input(model, dataloader, nsamples, seqlen):
+    """
+    Prepare inputs for model calibration.
+
+    Args:
+        model (nn.Module): The model to prepare inputs for.
+        dataloader (DataLoader): DataLoader object to fetch input data.
+        device (torch.device): Device on which the model is loaded.
+
+    Returns:
+        inps (torch.Tensor): Input tensor for calibration.
+        outs (torch.Tensor): Output tensor for calibration.
+        attention_mask (torch.Tensor): Attention mask tensor.
+        position_ids (torch.Tensor): Position IDs tensor.
+    """
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.model.layers
-
-    # dev = model.hf_device_map["model.embed_tokens"]
-    # if "model.embed_tokens" in model.hf_device_map:
-    #     device = model.hf_device_map["model.embed_tokens"]
-
-    dtype = next(iter(model.parameters())).dtype #获取模型第一层(next函数)参数的数据类型
-    #hidden_size就是每一个token的向量表示的维度,原始数据是[batch_size, seq_len]，输入到模型经过词嵌入层，得到每个token的词嵌入向量表示
-    inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
+    try:
+        layers = model.model.layers
+    except AttributeError:
+        try:
+            layers = model.base_model.layers
+        except AttributeError:
+            layers = model.base_model.decoder.layers
+    if "model.embed_tokens" in getattr(model, 'hf_device_map', {}):
+        device = model.hf_device_map["model.embed_tokens"]
+    else:
+        device = model.device
+    dtype = next(iter(model.parameters())).dtype
+    # dtype = torch.float
+    inps = torch.zeros((nsamples, seqlen, model.config.hidden_size), dtype=dtype, device=device)
     inps.requires_grad = False
-    #下面i表示当前batch的索引
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'attention_mask': None, "position_ids": None, "cache_position": None, "position_embeddings": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
+            if hasattr(module, "self_attn"):
+                self.self_attn = module.self_attn
+            elif hasattr(module, "attn"):
+                self.attn = module.attn
+
         def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp #保存输入到预分配的inps中，捕获输入
-            cache['i'] += 1 #更新索引
+            inps[cache['i']] = inp
+            cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
-            raise ValueError #故意抛出异常，终止当前的forward函数后续计算
-    layers[0] = Catcher(layers[0]) #只捕获第一层的输入，layers是原模型层的引用，这里相当于把原模型第一层替换为Catcher类的实例，
+            if 'cache_position' in kwargs and 'position_embeddings' in kwargs:
+                cache['cache_position'] = kwargs['cache_position']
+                cache['position_embeddings'] = kwargs['position_embeddings']
+            raise ValueError
 
-    #替换的是大块的LlamaDecoderLayer(0)，正常情况是：output = layers[0](embedded, attention_mask, position_ids)
-    #现在变成Catcher(layers[0])(embedded, attention_mask, position_ids)
+    layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
-            model(batch[0].to(device)) #等价于：model.forward(batch[0].to(device)),进行前向传播
+            # model(torch.rand_like(batch[0].to(device)))
+            model(batch[0].to(device))
         except ValueError:
-            pass 
-    layers[0] = layers[0].module #再把Catcher类实例 恢复为 原模型的第一层
+            pass
+    layers[0] = layers[0].module
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
     model.config.use_cache = use_cache
 
-    return inps, outs, attention_mask, position_ids 
+    if 'cache_position' in cache and 'position_embeddings' in cache:
+        cache_position = cache['cache_position']
+        position_embeddings = cache['position_embeddings']
+        return inps, outs, attention_mask, position_ids, cache_position, position_embeddings
+    return inps, outs, attention_mask, position_ids
+
 
 def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     #alpha是剪枝比例因子
@@ -1149,7 +1280,9 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
     print("dataset loading complete")
 
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+        #inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+        returned_data = prepare_calibration_input(model, dataloader, args.nsamples, model.seqlen)
+        inps, outs, attention_mask, position_ids = returned_data[:4]
 
     layers = model.model.layers
     
@@ -1162,7 +1295,13 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
         dev = device
         if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+            inps = inps.to(dev)
+            outs = outs.to(dev)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(dev)
+            if position_ids is not None:
+                position_ids = position_ids.to(dev)
+
 
         # 收集激活值
         wrapped_layers = {}
@@ -1178,9 +1317,22 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
         for name in wrapped_layers:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
+        rotary_emb = model.model.rotary_emb
+        if position_ids is None:
+            seq_len = inps.shape[1]
+            position_ids = torch.arange(seq_len, device=dev).unsqueeze(0)
+
+
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                position_embeddings = rotary_emb(inps[j], position_ids)
+                outs[j] = layer(
+                    inps[j].unsqueeze(0),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings
+                )[0]
+
 
         for h in handles:
             h.remove()
@@ -1188,32 +1340,55 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
         # 对每个线性层进行剪枝
         for name in subset:
             original_weight = subset[name].weight.data.clone()
-            
+            in_features = subset[name].in_features
+            out_features = subset[name].out_features
             # 使用模块化的处理函数
-            B_structured, layer_compensation_params = process_layer_compensation(
-                i, name, original_weight, wrapped_layers[name], args, dev, prune_n, prune_m
-            )
-            
-            # 如果有补偿参数，保存到总的字典中
-            if layer_compensation_params is not None:
-                layer_key = f"model.layers.{i}.{name}"
-                compensation_params[layer_key] = layer_compensation_params
+            #B_structured, layer_compensation_params = process_layer_compensation(
+            #    i, name, original_weight, wrapped_layers[name], args, dev, prune_n, prune_m
+            #)
 
             # 线性层的权重被设置为纯粹的、稀疏的结构化剪枝结果
-            subset[name].weight.data = B_structured
-            print(f"    Layer weight is set to the sparse structured matrix.")
+            #subset[name].weight.data = B_structured
+
+            # 如果有补偿参数，保存到总的字典中
+            # if layer_compensation_params is not None:
+            #     print(f"Replacing layer: model.layers.{i}.{name}")
+            #     params = layer_compensation_params
+            #     new_layer = CompensatedSparseLinear(subset[name], params)
+            #     parent_name, child_name = name.rsplit('.', 1)
+            #     parent_module = model.get_submodule(f"model.layers.{i}.{parent_name}")
+            #     setattr(parent_module, child_name, new_layer)
+            #print(f"    Layer weight is set to the sparse structured matrix.")
+            _, final_weight_factors = process_layer_compensation(
+                i, name, original_weight, wrapped_layers[name], args, dev, prune_n, prune_m
+            )
+            subset[name].weight.data = original_weight
+            if final_weight_factors is not None:
+                print(f"  -> Replacing layer 'model.layers.{i}.{name}' with LowRankLinear.")
+                # Create the new layer with the computed factors.
+                new_layer = LowRankLinear(final_weight_factors, in_features, out_features)
+                # Get the parent module to perform the replacement.
+                parent_name, child_name = name.rsplit('.', 1)
+                parent_module = model.get_submodule(f"model.layers.{i}.{parent_name}")
+                setattr(parent_module, child_name, new_layer)
+            
 
         # 重新计算层输出
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                position_embeddings = rotary_emb(inps[j], position_ids)
+                outs[j] = layer(
+                    inps[j].unsqueeze(0),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings
+                )[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
-    
-    print("\n=== Wanda compensation parameter generation completed ===")
-    return compensation_params
+    print("\n=== Wanda compensation completed ===")
+    return model
 
 
 

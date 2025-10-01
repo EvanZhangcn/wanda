@@ -55,7 +55,7 @@ class WrappedGPT:
 
         # 更新全局最大值记录
         if self.act_scales is None:
-            self.act_scales = comming_max
+            self.act_scales = comming_max.clone()
         else:
             self.act_scales = torch.max(self.act_scales, comming_max)
 

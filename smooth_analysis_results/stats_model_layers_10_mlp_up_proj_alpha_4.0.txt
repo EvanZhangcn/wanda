@@ -1,0 +1,10 @@
+Layer: model.layers.10.mlp.up_proj
+Alpha: 4.0
+
+Energy@8: unsmooth=1.29%, smooth=95.19% (Δ=93.90pp)
+Energy@16: unsmooth=2.33%, smooth=98.83% (Δ=96.50pp)
+Energy@32: unsmooth=4.15%, smooth=99.89% (Δ=95.74pp)
+Energy@64: unsmooth=7.17%, smooth=99.91% (Δ=92.74pp)
+Energy@128: unsmooth=12.16%, smooth=99.92% (Δ=87.76pp)
+Energy@256: unsmooth=20.28%, smooth=99.93% (Δ=79.64pp)
+s stats: min=5.5164e-01, max=1.7383e+03, mean=3.3856e+00

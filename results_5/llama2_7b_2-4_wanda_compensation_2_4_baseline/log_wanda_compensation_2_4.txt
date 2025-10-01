@@ -1,0 +1,8 @@
+method	actual_sparsity	ppl_test
+wanda_compensation_2_4	0.5000	6.9203
+
+--- Benchmark Results ---
+Batch Size: 1
+Latency: 814.6704 ms
+Throughput: 1.23 samples/sec
+Peak Memory: 4955.78 MB
