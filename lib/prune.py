@@ -8,11 +8,13 @@ import matplotlib.pyplot as plt
 from kneed import KneeLocator
 import os
 
+
 from .sparsegpt import SparseGPT 
 from .layerwrapper import WrappedGPT
 from .data import get_loaders 
 
 from .ablate import AblateGPT 
+
 
 # 用于存储补偿参数的局部字典（在函数内使用）
 # COMPENSATION_PAaRAMS 将在函数内部创建，避免全局状态
@@ -73,36 +75,28 @@ from .ablate import AblateGPT
 #         return self
 
 class LowRankLinear(nn.Module):
-    """A linear layer represented by low-rank factors with smoothing."""
-
+    """Low-rank linear layer with smoothing and fused Hadamard transforms."""
     def __init__(self, final_weight_factors, in_features, out_features):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-
-        # Load the low-rank factors and inverse scaling factor
         self.L1 = nn.Parameter(final_weight_factors['L1'], requires_grad=False)  # (out_features, rank)
         self.L2 = nn.Parameter(final_weight_factors['L2'], requires_grad=False)  # (rank, in_features)
         self.s_inv = nn.Parameter(final_weight_factors['s_inv'], requires_grad=False)  # (1, in_features)
-
     def forward(self, x):
         # The forward pass computes: (x * s_inv) @ (L1 @ L2)^T
         original_shape = x.shape
         if x.dim() > 2:
             x = x.view(-1, x.shape[-1])
 
-        # Ensure device and dtype consistency
-        target_device = self.L1.device
-        target_dtype = self.L1.dtype
-        x = x.to(target_device, dtype=target_dtype)
-
-        # Apply smoothing to the input activation
+        original_device = x.device
+        original_dtype = x.dtype
+        x = x.to(self.s_inv.device, dtype=self.s_inv.dtype)
         x_smoothed = x * self.s_inv
 
-        # Perform the low-rank matrix multiplication
-        # (x @ L2^T) @ L1^T
+        #分步写结果， 检查L1，L2相乘后有无问题。
         output = (x_smoothed @ self.L2.t()) @ self.L1.t()
-
+        output = output.to(original_device, dtype = original_dtype)
         # Reshape output to match the original shape's batch/sequence dimensions
         if len(original_shape) > 2:
             output = output.view(*original_shape[:-1], self.out_features)
@@ -121,26 +115,29 @@ def create_final_compensated_model(structured_model, compensation_params):
         if name in compensation_params:
             if isinstance(module, nn.Linear):
                 print(f"Replacing layer: {name}")
-                
+
                 # 创建新的补偿层
                 # 将补偿参数移动到与模型相同的设备和数据类型
                 params = compensation_params[name]
                 target_dtype = module.weight.dtype
                 target_device = module.weight.device
-                
+
                 for k, v in params.items():
                     params[k] = v.to(device=target_device, dtype=target_dtype)
 
                 new_layer = CompensatedSparseLinear(module, params)
-                
+
                 # 获取父模块并替换
                 parent_name, child_name = name.rsplit('.', 1)
                 parent_module = structured_model.get_submodule(parent_name)
                 setattr(parent_module, child_name, new_layer)
-                
+
     return structured_model
 
-def calculate_smoothing_scale_factor(activation_scales, delta_B, alpha=0.5):
+
+
+
+def calculate_smoothing_scale_factor(activation_scales, matrix, alpha=0.5):
     """
     根据激活尺度和误差矩阵计算Smoothing缩放因子s，然后作用于输入通道
     参数:
@@ -153,15 +150,16 @@ def calculate_smoothing_scale_factor(activation_scales, delta_B, alpha=0.5):
     """
     # 计算 delta_B 每一列的绝对值最大值
     # 对应 SmoothQuant 论文中的 max(|W_j|)
-    delta_B_input_channel_max_abs = torch.max(torch.abs(delta_B), dim=0, keepdim=True)[0].clamp(min=1e-5)
+    matrix_input_channel_max_abs = torch.max(torch.abs(matrix), dim=0, keepdim=True)[0].clamp(min=1e-5)
 
     # 平滑公式
     # 为了防止除零，添加一个小的epsilon
     #epsilon = 1e-6
-    #s = torch.pow(activation_scales, alpha) / (torch.pow(delta_B_input_channel_max_abs, 1 - alpha) + epsilon)
-    #s = torch.pow(activation_scales, alpha) / (torch.pow(delta_B_input_channel_max_abs, 1 - alpha))
-    s = torch.pow(activation_scales, alpha)
-    # 如果一个通道在 delta_B 中全为零，
+    #s = torch.pow(activation_scales, alpha) / (matrix_input_channel_max_abs, 1 - alpha) + epsilon)
+    #s = torch.pow(activation_scales, alpha) / (matrix_input_channel_max_abs, 1 - alpha))
+
+    s = torch.pow(activation_scales, alpha)  
+    # 如果一个通道在 matrix_input_channel_max_abs 中全为零，
     # 那么它的缩放因子应该为1，即不进行缩放。
     #s[delta_B_input_channel_max_abs == 0] = 1.0
 
@@ -170,59 +168,45 @@ def calculate_smoothing_scale_factor(activation_scales, delta_B, alpha=0.5):
     s = torch.clamp(s, min=1e-5) 
     return s
 
+
+
 def low_rank_approximation_factors(matrix, rank):
     """对矩阵进行SVD并返回低秩因子"""
     print(f"    Computing SVD factors for matrix shape: {matrix.shape}")
-    
-    # 如果rank为None，设置为矩阵最小维度的1/4
-    if rank is None:
-        rank = min(matrix.shape[0], matrix.shape[1]) // 4
-    
+
     # 确保rank不超过矩阵的最小维度
     max_rank = min(matrix.shape[0], matrix.shape[1])
     rank = min(rank, max_rank)
-    
-    if rank <= 0:
-        print(f"    Warning: rank {rank} is invalid, returning zero factors")
-        return (torch.zeros(matrix.shape[0], 1, device=matrix.device, dtype=matrix.dtype), 
-                torch.zeros(1, matrix.shape[1], device=matrix.device, dtype=matrix.dtype))
-    
     print(f"    Using rank: {rank}")
-    
+
     # 保存原始数据类型和设备
     original_dtype = matrix.dtype
     original_device = matrix.device
     try:
-        # 转换为float32进行SVD计算，并移到CPU以节省GPU内存
+        #这里必须转换为float32，因为Pytorch不支持对Half进行SVD
         matrix_cpu = matrix.float().cpu()
-        
         U, S, Vh = torch.linalg.svd(matrix_cpu, full_matrices=False)
         # --- SVD计算结束 ---
-        
         # 截断到指定秩
         U_k = U[:, :rank]  # [m, rank]
         S_k = S[:rank]     # [rank]
         Vh_k = Vh[:rank]   # [rank, n]
-        
         # 将奇异值分配给两个因子
         sqrt_S = torch.sqrt(S_k + 1e-10)  # 添加小常数以避免数值问题
         L1 = U_k @ torch.diag(sqrt_S)      # [m, rank]
         L2 = torch.diag(sqrt_S) @ Vh_k      # [rank, n]
-        
         # 转换回原始数据类型，但保持在CPU上
         L1 = L1.to(dtype=original_dtype)
         L2 = L2.to(dtype=original_dtype)
-        
         print(f"    Factor dimensions - L1: {L1.shape}, L2: {L2.shape}")
         print(f"    Successfully computed low-rank factors")
         return L1, L2
-        
+
     except Exception as e:
         print(f"    Error in SVD factor computation: {e}")
         print(f"    Returning zero factors for safety")
-        return (torch.zeros(matrix.shape[0], 1, dtype=original_dtype), 
+        return (torch.zeros(matrix.shape[0], 1, dtype=original_dtype),
                 torch.zeros(1, matrix.shape[1], dtype=original_dtype))
-
 
 def plot_svd_analysis(axes_row, matrix, matrix_name, title_prefix):
     """
@@ -291,6 +275,7 @@ def plot_svd_analysis(axes_row, matrix, matrix_name, title_prefix):
         ax_right.annotate(f'Top 64 Ranks\nEnergy: {energy:.2f}%', xy=(x, y), xytext=(-80, 20),
                           textcoords='offset points',
                           arrowprops=dict(facecolor='purple', shrink=0.05))
+
 
 
 def analyze_activation_scales(activation_scales, layer_index, layer_name):
@@ -391,16 +376,15 @@ def plot_dense_matrix_experiment(layer_index, layer_name, original_weight, activ
     print("  [TASK 2 EXPERIMENT] Dense matrix test completed.\n")
 
 
-def smooth_and_compensate(delta_B, activation_scales, args):
+def smooth_and_compensate(matrix, activation_scales, args):
     """执行平滑处理并返回平滑后的矩阵和逆缩放因子"""
     # 计算缩放因子 s 和其倒数 s_inv
-    s = calculate_smoothing_scale_factor(activation_scales, delta_B, alpha=args.alpha)
+    s = calculate_smoothing_scale_factor(activation_scales, matrix, alpha=args.alpha)
     s_inv = 1.0 / s
-    
-    # 对 delta_B 进行变换
-    delta_B_smoothed = delta_B * s
-    
-    return delta_B_smoothed, s_inv
+
+    # 对 matrix 进行变换
+    matrix_smoothed = matrix * s
+    return matrix_smoothed, s_inv
 
 
 def analyze_delta_B_and_plot_svd(delta_B, delta_B_smoothed, layer_index, layer_name):
@@ -866,10 +850,9 @@ def process_layer_compensation(layer_index, layer_name, original_weight, wrapped
 
         # Step 3: Compute low-rank factors using SVD.
         print(f"  Step 3: Computing low-rank factors via SVD...")
-        # You can control the rank via an argument, e.g., args.compensation_rank
         final_rank = getattr(args, 'compensation_rank', 64) # 如果没拿到，最后一个参数64作为默认值
         print(f"    Target rank for final weight: {final_rank}")
-        
+
         L1, L2 = low_rank_approximation_factors(W_dense_smoothed, rank=final_rank)
 
         # Store the factors that will represent the entire layer.
@@ -889,8 +872,7 @@ def process_layer_compensation(layer_index, layer_name, original_weight, wrapped
         print(f"    An error occurred during smoothing or SVD for layer {layer_name}: {e}")
         print(f"    Skipping factorization for this layer.")
 
-    # Return None for the first value (as there's no B_structured) and the new factors.
-    return None, final_weight_factors
+    return final_weight_factors
 
 
 
@@ -1092,8 +1074,8 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             return tmp
 
         handles = []
+        # 为每个 WrappedGPT 实例注册前向钩子，以捕获输入和输出
         for name in wrapped_layers:
-            #一个layer的所有线性层注册钩子函数，捕获每个样本的输入和输出
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
         for j in range(args.nsamples):
@@ -1261,32 +1243,25 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
 
 def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     """
-    执行带有补偿逻辑的Wanda剪枝并返回补偿参数
     调用以下模块完成：
-    - analyze_activation_scales: 分析激活尺度
-    - plot_dense_matrix_experiment: 稠密矩阵实验
     - smooth_and_compensate: 平滑处理
     - analyze_delta_B_and_plot_svd: SVD分析和绘图
     - process_layer_compensation: 处理单个层的补偿逻辑
     """
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    
-    # 用于存储补偿参数的局部字典
-    compensation_params = {}
-    
+
     print("loading calibration data")
     dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
     print("dataset loading complete")
 
     with torch.no_grad():
-        #inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
         returned_data = prepare_calibration_input(model, dataloader, args.nsamples, model.seqlen)
         inps, outs, attention_mask, position_ids = returned_data[:4]
 
     layers = model.model.layers
-    
-    for i in range(len(layers)):
+
+    for i in range(len(layers) - 4, len(layers)):
         print(f"\n=== Processing Layer {i} ===")
         layer = layers[i]
         subset = find_layers(layer)
@@ -1359,7 +1334,7 @@ def prune_wanda_with_compensation(args, model, tokenizer, device=torch.device("c
             #     parent_module = model.get_submodule(f"model.layers.{i}.{parent_name}")
             #     setattr(parent_module, child_name, new_layer)
             #print(f"    Layer weight is set to the sparse structured matrix.")
-            _, final_weight_factors = process_layer_compensation(
+            final_weight_factors = process_layer_compensation(
                 i, name, original_weight, wrapped_layers[name], args, dev, prune_n, prune_m
             )
             subset[name].weight.data = original_weight

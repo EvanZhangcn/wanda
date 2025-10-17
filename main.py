@@ -21,7 +21,6 @@ def get_llm(model_name, cache_dir="llm_weights"):
         low_cpu_mem_usage=True, 
         device_map="auto"
     )
-
     #设置模型一次性处理的最大token数（即序列长度）
     if model.config.max_position_embeddings > 2048:
         model.seqlen = 2048
@@ -139,6 +138,11 @@ def main():
 
     parser.add_argument('--alpha', type=float, default=0.5, help='Strength for smoothing migration (alpha hyperparameter).')
 
+
+    parser.add_argument('--run_benchmark', action="store_true", help="Whether to run a performance benchmark after evaluation.")
+    parser.add_argument('--benchmark_batch_size', type=int, default=1, help="Batch size for performance benchmark.")
+    parser.add_argument('--benchmark_repeats', type=int, default=100, help="Number of repetitions for performance benchmark.")
+
     #解析传入的参数，存入args
     args = parser.parse_args()
 
@@ -183,10 +187,10 @@ def main():
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
 
     ################################################################
-    print("*"*30)
-    sparsity_ratio = check_sparsity(model) #检查剪枝后的稀疏度
-    print(f"sparsity sanity check {sparsity_ratio:.4f}")
-    print("*"*30)
+    #print("*"*30)
+    #sparsity_ratio = check_sparsity(model) #检查剪枝后的稀疏度
+    #print(f"sparsity sanity check {sparsity_ratio:.4f}")
+    #print("*"*30)
     ################################################################
     ppl_test = eval_ppl(args, model, tokenizer, device)
 
@@ -200,8 +204,9 @@ def main():
     with open(save_filepath, "w") as f:
         # eg: 写入log_wanda.txt文件表头：剪枝方法、实际稀疏度、测试困惑度
         print("method\tactual_sparsity\tppl_test", file=f, flush=True)
-        print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
-
+        #print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
+        #print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
+        print(f"{args.prune_method}\t{ppl_test:.4f}", file=f, flush=True)
     if args.eval_zero_shot:
         accelerate=False
         if "30b" in args.model or "65b" in args.model or "70b" in args.model:
